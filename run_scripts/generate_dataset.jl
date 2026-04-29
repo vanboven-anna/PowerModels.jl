@@ -24,13 +24,18 @@ Random.seed!(2)
 
 function _determine_acpf_feasibility(test_case, viol_dict; epsilon=1e-5)
     total_violations, total_vm_violations, total_q_violations, total_branch_violations = 0, 0, 0, 0
+    total_violation_mag, total_vm_violation_mag, total_q_violation_mag, total_branch_violation_mag = 0, 0, 0, 0
     # Check flow limits 
     flows = PowerModels.calc_branch_flow_ac(test_case)["branch"]
     for (ind, flow) in pairs(flows)
         viol_dict["lf_viol_$ind"] =   Int((flow["pf"]^2  + flow["qf"]^2 <= test_case["branch"][ind]["rate_a"]^2 + epsilon) && 
                                         (flow["pt"]^2  + flow["qt"]^2 <= test_case["branch"][ind]["rate_a"]^2 + epsilon))
+        viol_dict["lf_viol_mag_$ind"] = max(0, flow["pf"]^2  + flow["qf"]^2 - test_case["branch"][ind]["rate_a"]^2) + 
+                                        max(0, flow["pt"]^2  + flow["qt"]^2 - test_case["branch"][ind]["rate_a"]^2)
         total_violations += 1 - viol_dict["lf_viol_$ind"]
         total_branch_violations += 1 - viol_dict["lf_viol_$ind"]
+        total_violation_mag += viol_dict["lf_viol_mag_$ind"]
+        total_branch_violation_mag += viol_dict["lf_viol_mag_$ind"]
     end
 
     # Check angle limits
@@ -39,24 +44,36 @@ function _determine_acpf_feasibility(test_case, viol_dict; epsilon=1e-5)
                                         test_case["bus"][string(branch["t_bus"])]["va"]) <= branch["angmax"] + epsilon) && 
                                         (abs(test_case["bus"][string(branch["f_bus"])]["va"] - 
                                         test_case["bus"][string(branch["t_bus"])]["va"]) >= branch["angmin"] - epsilon))
+        viol_dict["la_viol_mag_$ind"] = max(0, abs(test_case["bus"][string(branch["f_bus"])]["va"] - 
+                                        test_case["bus"][string(branch["t_bus"])]["va"]) - branch["angmax"]) + 
+                                        abs(min(0, test_case["bus"][string(branch["f_bus"])]["va"] - 
+                                        test_case["bus"][string(branch["t_bus"])]["va"] - branch["angmin"] ))
         total_violations += 1 - viol_dict["la_viol_$ind"]
         total_branch_violations += 1 - viol_dict["la_viol_$ind"]
+        total_violation_mag += viol_dict["la_viol_mag_$ind"]
+        total_branch_violation_mag += viol_dict["la_viol_mag_$ind"]
     end
 
     # Voltage magnitude limits
     for (ind, bus) in pairs(test_case["bus"])
         viol_dict["vmviol_$ind"] =  Int(bus["vm"] <= bus["vmax"] + epsilon &&
                                  bus["vm"] + epsilon >= bus["vmin"])
+        viol_dict["vmviol_mag_$ind"] = max(0, bus["vm"] - bus["vmax"]) + abs(min(0, bus["vm"] - bus["vmin"]))
         total_violations += 1 - viol_dict["vmviol_$ind"]
         total_vm_violations += 1 - viol_dict["vmviol_$ind"]
+        total_violation_mag += viol_dict["vmviol_mag_$ind"]
+        total_vm_violation_mag += viol_dict["vmviol_mag_$ind"]
     end 
 
     # Reactive power limits
     for (ind, gen) in pairs(test_case["gen"])
         viol_dict["qviol_$ind"] =  Int(gen["qg"] <= gen["qmax"] + epsilon &&
                                 gen["qg"] >= gen["qmin"] - epsilon)
+        viol_dict["qviol_mag_$ind"] = max(0, gen["qg"] - gen["qmax"]) + abs(min(0, gen["qg"] - gen["qmin"]))
         total_violations += 1 - viol_dict["qviol_$ind"]
         total_q_violations += 1 - viol_dict["qviol_$ind"]
+        total_violation_mag += viol_dict["qviol_mag_$ind"]
+        total_q_violation_mag += viol_dict["qviol_mag_$ind"]
     end
 
     # add other values 
@@ -64,6 +81,10 @@ function _determine_acpf_feasibility(test_case, viol_dict; epsilon=1e-5)
     viol_dict["total_branch_violations"] = total_branch_violations 
     viol_dict["total_vm_violations"] = total_vm_violations 
     viol_dict["total_q_violations"] = total_q_violations 
+    viol_dict["total_violation_mag"] = total_violation_mag 
+    viol_dict["total_branch_violation_mag"] = total_branch_violation_mag 
+    viol_dict["total_vm_violation_mag"] = total_vm_violation_mag 
+    viol_dict["total_q_violation_mag"] = total_q_violation_mag 
     return viol_dict
 end
 
@@ -210,11 +231,18 @@ function generate_solutions(case_name, delta, test_case, load_data, file_pth, ru
                 ["vm_$bus_ind" for bus_ind in keys(test_case["bus"])])
     soln_df = DataFrame([name => Float64[] for name in cols])
     cols = vcat(["datapoint", "run_id", "iter"], 
-                ["total_violations", "total_vm_violations", "total_q_violations", "total_branch_violations"],
+                ["total_violations", "total_vm_violations", 
+                "total_q_violations", "total_branch_violations"],
+                ["total_violation_mag", "total_vm_violation_mag", 
+                "total_q_violation_mag", "total_branch_violation_mag"],
                 ["qviol_$gen_ind" for gen_ind in keys(test_case["gen"])],
                 ["vmviol_$bus_ind" for bus_ind in keys(test_case["bus"])],
                 ["lf_viol_$branch_ind" for branch_ind in keys(test_case["branch"])],
-                ["la_viol_$branch_ind" for branch_ind in keys(test_case["branch"])]
+                ["la_viol_$branch_ind" for branch_ind in keys(test_case["branch"])],
+                ["qviol_mag_$gen_ind" for gen_ind in keys(test_case["gen"])],
+                ["vmviol_mag_$bus_ind" for bus_ind in keys(test_case["bus"])],
+                ["lf_viol_mag_$branch_ind" for branch_ind in keys(test_case["branch"])],
+                ["la_viol_mag_$branch_ind" for branch_ind in keys(test_case["branch"])],
                 )
     violations_df = DataFrame([name => Float64[] for name in cols])
     cols = vcat(["datapoint", "run_id", "iter"], 
@@ -226,16 +254,25 @@ function generate_solutions(case_name, delta, test_case, load_data, file_pth, ru
     # iterate through acpf combos 
     run_id = 0
     for pf_type in run_dict["pf_types"]
-        for obo in run_dict["obo"]
-            if pf_type in ["baseline", "qlim"]
+        for grainger in run_dict["grainger"]
+            if pf_type == "baseline"
                 run_id += 1 
                 run_flags = Dict("run_id" => run_id, "pf_type" => pf_type, 
-                            "obo" => obo, "swap_technique" => "none", "grainger" => 0)
-                println("Running ID $run_id: pf_type = $pf_type, obo = $obo")
+                            "obo" => 0, "swap_technique" => "none", "grainger" => grainger)
+                println("Running ID $run_id: pf_type = $pf_type, grainger = $grainger")
                 run_pf!(test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
+            elseif pf_type == "qlim"
+                for obo in run_dict["obo"]
+                    run_id += 1 
+                    run_flags = Dict("run_id" => run_id, "pf_type" => pf_type, 
+                                "obo" => obo, "swap_technique" => "none", "grainger" => grainger)
+                    println("Running ID $run_id: pf_type = $pf_type, obo = $obo, grainger = $grainger")
+                    run_pf!(test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
+                
+                end
             else
-                for swap_technique in run_dict["swap_techniques"]
-                    for grainger in run_dict["grainger"]
+                for obo in run_dict["obo"]
+                    for swap_technique in run_dict["swap_techniques"]
                         run_id += 1 
                         run_flags = Dict("run_id" => run_id, "pf_type" => pf_type, 
                                     "obo" => obo, "swap_technique" => swap_technique, "grainger" => grainger
@@ -428,6 +465,10 @@ function main()
                     "obo" => [0,1], "grainger" => [0,1], 
                     "swap_techniques" => ["nearest_gen", "qv_inv"]
                 )
+    # run_dict = Dict("pf_types" => ["baseline"],
+    #             "obo" => [0], "grainger" => [0], 
+    #             "swap_techniques" => ["nearest_gen", "qv_inv"]
+    #         )
     load_data = DataFrame(XLSX.readtable(joinpath(TESTCASE_PATH, "data/$(CASE_NAME)/loads/$delta.xlsx"), "loads"))
-    generate_solutions(CASE_NAME, delta, test_case, load_data, file_pth, run_dict; num_samples = 10, write_out = true)
+    generate_solutions(CASE_NAME, delta, test_case, load_data, file_pth, run_dict; num_samples = 100, write_out = true)
 end

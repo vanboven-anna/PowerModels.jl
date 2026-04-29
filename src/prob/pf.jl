@@ -1143,8 +1143,8 @@ function compute_ac_pf_mult_buses(pf_data::PowerFlowData; kwargs...)
                 solution = best_solution["solution"]
                 bus_type_idx = best_solution["bus_type_idx"]
                 pf_data = best_solution["pf_data"]
-                best_converged = true
-
+                best_converged, is_feas = true, true
+                break
             elseif isnothing(best_solution["solution"])
                 @_debug( "No converged state thus far.")
                 bus_assignment = Dict(i => Dict("vm"=>-1, "va"=>-1) for i in keys(pf_data.data["bus"]))

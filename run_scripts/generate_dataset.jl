@@ -450,7 +450,7 @@ function generate_loads(test_case, num_points, delta, case_name)
 end
 
 function main()
-    CASE_NAME = "case300"
+    CASE_NAME = "case14"
     file_pth = joinpath(DATA_PATH, "test_cases/network_info/$CASE_NAME/$(CASE_NAME).m")
     test_case = PowerModels.parse_file(file_pth)
     test_case = prepare_test_case(test_case, CASE_NAME, file_pth)
@@ -458,7 +458,7 @@ function main()
     max_pg = sum([gen["pmax"] for gen in values(test_case["gen"])])
     base_load = sum([load["pd"] for load in values(test_case["load"])])
     delta = round(0.85*max_pg/base_load - 1, digits=2)
-    delta -= 0.03
+    # delta -= 0.03
 
     # pull in loads and generate dataset
     run_dict = Dict("pf_types" => ["mbuses", "qlim", "baseline"],

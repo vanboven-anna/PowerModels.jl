@@ -113,13 +113,15 @@ end
 
 function perform_analysis(run_info, violations; write_out = false, filename = nothing, print_out = true)
     analysis_df = DataFrame()
-    for run_id in 1:14
+    num_runs = unique(run_info[!, "run_id"])
+    for run_id in num_runs
         combined_df = combine_datasets(run_info, violations, run_id)
         run_analyses = analyze_dataset(combined_df)
         run_dict = parse_run_ids(run_info, run_id)
         curr_df = hcat(DataFrame(run_dict), DataFrame(run_analyses))
         append!(analysis_df, curr_df)
     end
+    export_analysis(analysis_df, write_out, filename, print_out)
     return analysis_df
 end
 

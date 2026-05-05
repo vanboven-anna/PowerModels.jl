@@ -2,7 +2,7 @@ include("../config.jl")
 include("find_nearest_gens.jl")
 include("generate_dataset.jl")
 using Pkg
-Pkg.activate(joinpath(@__DIR__, ".."))
+
 # Pkg.instantiate
 using Revise
 using PowerModels
@@ -44,6 +44,7 @@ function create_test_case(case_name, delta; data_ind = 0)
 end
 
 function main()
+    Pkg.activate(joinpath(@__DIR__, ".."))
     test_case, file_pth = create_test_case("case14", 1.53)
     # compute acpf 
     PowerModels.logger_config!("debug")

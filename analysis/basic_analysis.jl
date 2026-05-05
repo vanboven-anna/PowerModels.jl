@@ -1,7 +1,8 @@
 using Pkg
-Pkg.activate(joinpath(@__DIR__, ".."))
+# Pkg.activate(joinpath(@__DIR__, ".."))
 include("../run_scripts/generate_dataset.jl")
 include("../config.jl")
+include("./plotting_functions.jl")
 # Pkg.instantiate
 using Revise
 push!(LOAD_PATH, DATA_PATH)
@@ -127,17 +128,23 @@ end
 
 
 # pull in test case data
-case_name = "case57"
+case_name = "case14"
 file_pth = joinpath(DATA_PATH, "test_cases/network_info/$case_name/$(case_name).m")
 test_case = PowerModels.parse_file(file_pth)
 test_case = prepare_test_case(test_case, case_name, file_pth)
-delta = 0.34
-filename = joinpath(RESULTS_PATH, "$(case_name)/$delta.xlsx")
-run_info = DataFrame(XLSX.readtable(filename, "run_info"))
-solns = DataFrame(XLSX.readtable(filename, "solns"))
-bus_types = DataFrame(XLSX.readtable(filename, "bus_types"))
-violations = DataFrame(XLSX.readtable(filename, "violations"))
-analysis_df = perform_analysis(run_info, violations; write_out = true, filename = joinpath(RESULTS_PATH, "$(case_name)/$(delta)_basic_analysis.xlsx")); 
+delta = 1.53
+# # create analysis df
+# filename = joinpath(RESULTS_PATH, "$(case_name)/$delta.xlsx")
+# run_info = DataFrame(XLSX.readtable(filename, "run_info"))
+# solns = DataFrame(XLSX.readtable(filename, "solns"))
+# bus_types = DataFrame(XLSX.readtable(filename, "bus_types"))
+# violations = DataFrame(XLSX.readtable(filename, "violations"))
+# analysis_df = perform_analysis(run_info, violations; write_out = true, filename = joinpath(RESULTS_PATH, "$(case_name)/$(delta)_basic_analysis.xlsx"));
+
+# pull in analysis df and plot values 
+analysis_df = DataFrame(XLSX.readtable(joinpath(RESULTS_PATH, "$(case_name)/$(delta)_basic_analysis.xlsx"), "basic_analysis"))
+p = plot_bar_graph_features_scaled(analysis_df, ["jac_iters", "swap_iters", "time", "total_violation_mag"])
+display(p)
 
 
 

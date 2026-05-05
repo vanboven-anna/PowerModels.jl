@@ -249,6 +249,56 @@ function generate_solutions(case_name, delta, test_case, load_data, file_pth, ru
             ["bt_$bus_ind" for bus_ind in keys(test_case["bus"])]
             )
     bi_df = DataFrame([name => Float64[] for name in cols])
+    # prepare to write out 
+    existing_ids = []
+    if write_out
+        filename = joinpath(RESULTS_PATH, "$(case_name)/$delta.xlsx")
+        mkpath(dirname(filename))
+        file_mode = isfile(filename) ? "rw" : "w"       
+        XLSX.openxlsx(filename, mode=file_mode) do xf
+            existing_sheets = XLSX.sheetnames(xf)
+            if !("run_info" in existing_sheets)
+                sheet1 = XLSX.addsheet!(xf, "run_info")
+                XLSX.writetable!(sheet1, Tables.columntable(run_df))
+            else 
+                run_info = DataFrame(XLSX.gettable(xf["run_info"]))
+                existing_ids = unique(run_info[!, "run_id"])
+            end
+            if !("solns" in existing_sheets)
+                sheet2 = XLSX.addsheet!(xf, "solns")
+                XLSX.writetable!(sheet2, Tables.columntable(soln_df))
+            end
+            if !("bus_types" in existing_sheets)
+                sheet3 = XLSX.addsheet!(xf, "bus_types")
+                XLSX.writetable!(sheet3, Tables.columntable(bi_df))
+            end
+            if !("violations" in existing_sheets)
+                sheet4 = XLSX.addsheet!(xf, "violations")
+                XLSX.writetable!(sheet4, Tables.columntable(violations_df))
+            end
+        end
+    end
+    # helper function to write out data 
+    function write_out_data(df_run, df_soln, df_viol, df_bi)
+        if ~write_out 
+            return 
+        end
+        XLSX.openxlsx(filename, mode="rw") do xf
+            for (sheetname, new_data) in [("run_info", df_run), ("solns", df_soln), 
+                                          ("violations", df_viol), ("bus_types", df_bi)]
+                # grab sheet and existing data
+                sheet = xf[sheetname]
+                existing_data = DataFrame(XLSX.gettable(sheet))
+                
+                # Combine and write back
+                combined = isempty(existing_data) ? new_data : vcat(existing_data, new_data)
+                XLSX.writetable!(sheet, Tables.columntable(combined))
+                # empty the dataframe  
+                empty!(new_data)
+            end
+        end
+    end
+
     nearest_gens = find_nearest_generators_khop(file_pth)
 
     # iterate through acpf combos 
@@ -257,57 +307,69 @@ function generate_solutions(case_name, delta, test_case, load_data, file_pth, ru
         for grainger in run_dict["grainger"]
             if pf_type == "baseline"
                 run_id += 1 
+                if run_id in existing_ids 
+                    continue 
+                end
                 run_flags = Dict("run_id" => run_id, "pf_type" => pf_type, 
                             "obo" => 0, "swap_technique" => "none", "grainger" => grainger)
                 println("Running ID $run_id: pf_type = $pf_type, grainger = $grainger")
                 run_pf!(test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
+                write_out_data(run_df, soln_df, violations_df, bi_df)
             elseif pf_type == "qlim"
                 for obo in run_dict["obo"]
                     run_id += 1 
+                    if run_id in existing_ids 
+                        continue 
+                    end
                     run_flags = Dict("run_id" => run_id, "pf_type" => pf_type, 
                                 "obo" => obo, "swap_technique" => "none", "grainger" => grainger)
                     println("Running ID $run_id: pf_type = $pf_type, obo = $obo, grainger = $grainger")
                     run_pf!(test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
-                
+                    write_out_data(run_df, soln_df, violations_df, bi_df)
                 end
             else
                 for obo in run_dict["obo"]
                     for swap_technique in run_dict["swap_techniques"]
                         run_id += 1 
+                        if run_id in existing_ids 
+                            continue 
+                        end
                         run_flags = Dict("run_id" => run_id, "pf_type" => pf_type, 
                                     "obo" => obo, "swap_technique" => swap_technique, "grainger" => grainger
                                     )
                         test_case["pv_pairs"] = deepcopy(nearest_gens)
                         println("Running ID $run_id: pf_type = $pf_type, obo = $obo, swap_technique = $swap_technique, grainger = $grainger")
                         run_pf!(test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
+                        write_out_data(run_df, soln_df, violations_df, bi_df)
                     end
                 end
             end
         end
     end
-    if write_out
-        # write out data 
-        filename = joinpath(RESULTS_PATH, "$(case_name)/$delta.xlsx")
-        dir_path = dirname(filename)
-        mkpath(dir_path)
-        if isfile(filename)
-            rm(filename)
-        end
-        XLSX.openxlsx(filename, mode="w") do xf
-            sheet1 = XLSX.addsheet!(xf, "run_info")
-            XLSX.writetable!(sheet1, Tables.columntable(run_df))
-            sheet2 = XLSX.addsheet!(xf, "solns")
-            XLSX.writetable!(sheet2, Tables.columntable(soln_df))
-            sheet3 = XLSX.addsheet!(xf, "bus_types")
-            XLSX.writetable!(sheet3, Tables.columntable(bi_df))
-            sheet4 = XLSX.addsheet!(xf, "violations")
-            XLSX.writetable!(sheet4, Tables.columntable(violations_df))
-        end
-    end
+    # if write_out
+    #     # write out data 
+    #     filename = joinpath(RESULTS_PATH, "$(case_name)/$delta.xlsx")
+    #     dir_path = dirname(filename)
+    #     mkpath(dir_path)
+    #     if isfile(filename)
+    #         rm(filename)
+    #     end
+    #     XLSX.openxlsx(filename, mode="w") do xf
+    #         sheet1 = XLSX.addsheet!(xf, "run_info")
+    #         XLSX.writetable!(sheet1, Tables.columntable(run_df))
+    #         sheet2 = XLSX.addsheet!(xf, "solns")
+    #         XLSX.writetable!(sheet2, Tables.columntable(soln_df))
+    #         sheet3 = XLSX.addsheet!(xf, "bus_types")
+    #         XLSX.writetable!(sheet3, Tables.columntable(bi_df))
+    #         sheet4 = XLSX.addsheet!(xf, "violations")
+    #         XLSX.writetable!(sheet4, Tables.columntable(violations_df))
+    #     end
+    # end
 end
 
 function run_pf!(original_test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
     for (i, loads) in enumerate(eachrow(load_data))
+        println("$i...")
         if i > num_samples 
             break 
         end
@@ -450,7 +512,7 @@ function generate_loads(test_case, num_points, delta, case_name)
 end
 
 function main()
-    CASE_NAME = "case14"
+    CASE_NAME = "case300"
     file_pth = joinpath(DATA_PATH, "test_cases/network_info/$CASE_NAME/$(CASE_NAME).m")
     test_case = PowerModels.parse_file(file_pth)
     test_case = prepare_test_case(test_case, CASE_NAME, file_pth)
@@ -458,7 +520,7 @@ function main()
     max_pg = sum([gen["pmax"] for gen in values(test_case["gen"])])
     base_load = sum([load["pd"] for load in values(test_case["load"])])
     delta = round(0.85*max_pg/base_load - 1, digits=2)
-    # delta -= 0.03
+    delta -= 0.03
 
     # pull in loads and generate dataset
     run_dict = Dict("pf_types" => ["mbuses", "qlim", "baseline"],
@@ -470,5 +532,5 @@ function main()
     #             "swap_techniques" => ["nearest_gen", "qv_inv"]
     #         )
     load_data = DataFrame(XLSX.readtable(joinpath(TESTCASE_PATH, "data/$(CASE_NAME)/loads/$delta.xlsx"), "loads"))
-    generate_solutions(CASE_NAME, delta, test_case, load_data, file_pth, run_dict; num_samples = 100, write_out = true)
+    generate_solutions(CASE_NAME, delta, test_case, load_data, file_pth, run_dict; num_samples = 10, write_out = true)
 end

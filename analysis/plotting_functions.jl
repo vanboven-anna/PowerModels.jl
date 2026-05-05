@@ -1,4 +1,5 @@
 using Plots 
+using StatsPlots
 
 function plot_var_over_time(var_lst, label, p)
     var_val, val_counter = [], 0
@@ -36,5 +37,24 @@ function parse_var_vals(x_history, soln_history, mapping_dicts, var, bus_ind, p;
     end
 
     return plot_var_over_time(x_val, isnothing(label) ? "$bus_ind" : label, p)
+end
 
+function plot_bar_graph_features_scaled(analysis_df, feature_lst)
+    analysis_df[!, "run_id"] = 1:nrow(analysis_df)
+    # transform into matrix and scale each column
+    y_data = Float32.(Matrix(analysis_df[!, feature_lst]))
+    col_mins = minimum(y_data, dims=1)
+    col_maxs = maximum(y_data, dims=1)
+    y_scaled = (y_data .- col_mins) ./ (col_maxs .- col_mins)
+    p = groupedbar(
+        analysis_df.run_id,             
+        y_scaled,                
+        bar_position = :dodge,  
+        labels = reshape(feature_lst, 1, :),
+        xlabel = "Run ID",
+        ylabel = "Values",
+        legend = :outertopright, 
+        xticks = 1:nrow(analysis_df)           
+    )
+    return p
 end

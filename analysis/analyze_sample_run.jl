@@ -48,6 +48,34 @@ function plot_cond_det(results)
     display(combined_figure)
 end
 
+function plot_cond_submatrices(results)
+    jac_hist = parse_jacobian_history(results["jacobian_history"])
+    pthet_cond, pv_cond, qthet_cond, qv_cond, jac_cond = [], [], [], [], []
+    for (jac_iters, mapping_dict, bus_indices) in zip(jac_hist, results["mapping_dicts"], results["prev_bus_indices"])
+        pthet_iter, pv_iter, qthet_iter, qv_iter, jac_iter = [], [], [], [], []
+        for jacobian in jac_iters
+            submat_dict = PowerModels._jacobian_submatrix_(results["pf_data"], jacobian, mapping_dict, bus_indices)
+            push!(pthet_iter, min(cond(submat_dict["pthet"]), 200))
+            push!(pv_iter, min(cond(submat_dict["pv"]), 200))
+            push!(qthet_iter, min(cond(submat_dict["qthet"]), 200))
+            push!(qv_iter, min(cond(submat_dict["qv"]), 200))
+            push!(jac_iter, min(cond(jacobian), 200))
+        end
+        push!(pthet_cond, pthet_iter)
+        push!(pv_cond, pv_iter)
+        push!(qthet_cond, qthet_iter)
+        push!(qv_cond, qv_iter)
+        push!(jac_cond, jac_iter)
+    end
+    # plot values 
+    cond_plot = plot(title="condition number")
+    for (lst, label) in zip([pthet_cond, pv_cond, qthet_cond, qv_cond, jac_cond],
+                            ["p-theta", "p-v", "q-theta", "q-v", "full"])
+        cond_plot = plot_var_over_time(lst, label, cond_plot)
+    end
+    display(cond_plot)
+end
+
 "Plot variable values over time"
 function plot_var_vals(test_case, results)
     am = results["pf_data"].am
@@ -75,5 +103,6 @@ nearest_gens = find_nearest_generators_khop(file_pth)
 test_case["pv_pairs"] = nearest_gens
 result = PowerModels.compute_ac_pf_mult_buses(test_case, grainger = true,  swap_technique = "qv_inv", debug = true, obo = true)
 # plot_cond_det(result);
-plot_var_vals(test_case, result)
+# plot_var_vals(test_case, result);
+plot_cond_submatrices(result);
 

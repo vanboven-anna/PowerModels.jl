@@ -313,7 +313,9 @@ function generate_solutions(case_name, delta, test_case, load_data, file_pth, ru
                     continue 
                 end
                 run_flags = Dict("run_id" => run_id, "pf_type" => pf_type, 
-                            "obo" => 0, "swap_technique" => "none", "grainger" => grainger)
+                            "obo" => 0, "swap_technique" => "none", "grainger" => grainger,
+                                            "use_smw_warmstart" => 0,
+                                            "score_collateral_aware" => 0)
                 println("Running ID $run_id: pf_type = $pf_type, grainger = $grainger")
                 run_pf!(test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
                 write_out_data(run_df, soln_df, violations_df, bi_df)
@@ -324,7 +326,9 @@ function generate_solutions(case_name, delta, test_case, load_data, file_pth, ru
                         continue 
                     end
                     run_flags = Dict("run_id" => run_id, "pf_type" => pf_type, 
-                                "obo" => obo, "swap_technique" => "none", "grainger" => grainger)
+                                "obo" => obo, "swap_technique" => "none", "grainger" => grainger,
+                                            "use_smw_warmstart" => 0,
+                                            "score_collateral_aware" => 0)
                     println("Running ID $run_id: pf_type = $pf_type, obo = $obo, grainger = $grainger")
                     run_pf!(test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
                     write_out_data(run_df, soln_df, violations_df, bi_df)
@@ -343,8 +347,8 @@ function generate_solutions(case_name, delta, test_case, load_data, file_pth, ru
                             for collateral in collat_loop
                                 run_id += 1
                                 if run_id in existing_ids 
-                            continue 
-                        end
+                                    continue 
+                                end
                         run_flags = Dict("run_id" => run_id, "pf_type" => pf_type,
                                             "obo" => obo, "swap_technique" => swap_technique,
                                             "grainger" => grainger,
@@ -363,30 +367,10 @@ function generate_solutions(case_name, delta, test_case, load_data, file_pth, ru
             end
         end
     end
-    # if write_out
-    #     # write out data 
-    #     filename = joinpath(RESULTS_PATH, "$(case_name)/$delta.xlsx")
-    #     dir_path = dirname(filename)
-    #     mkpath(dir_path)
-    #     if isfile(filename)
-    #         rm(filename)
-    #     end
-    #     XLSX.openxlsx(filename, mode="w") do xf
-    #         sheet1 = XLSX.addsheet!(xf, "run_info")
-    #         XLSX.writetable!(sheet1, Tables.columntable(run_df))
-    #         sheet2 = XLSX.addsheet!(xf, "solns")
-    #         XLSX.writetable!(sheet2, Tables.columntable(soln_df))
-    #         sheet3 = XLSX.addsheet!(xf, "bus_types")
-    #         XLSX.writetable!(sheet3, Tables.columntable(bi_df))
-    #         sheet4 = XLSX.addsheet!(xf, "violations")
-    #         XLSX.writetable!(sheet4, Tables.columntable(violations_df))
-    #     end
-    # end
 end
 
 function run_pf!(original_test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
     for (i, loads) in enumerate(eachrow(load_data))
-        println("$i...")
         if i > num_samples 
             break 
         end

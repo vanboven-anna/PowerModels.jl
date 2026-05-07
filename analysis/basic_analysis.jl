@@ -128,24 +128,34 @@ end
 
 
 # pull in test case data
-case_name = "case14"
+case_name = "case300"
 file_pth = joinpath(DATA_PATH, "test_cases/network_info/$case_name/$(case_name).m")
 test_case = PowerModels.parse_file(file_pth)
 test_case = prepare_test_case(test_case, case_name, file_pth)
-delta = 1.53
-# # create analysis df
-# filename = joinpath(RESULTS_PATH, "$(case_name)/$delta.xlsx")
-# run_info = DataFrame(XLSX.readtable(filename, "run_info"))
-# solns = DataFrame(XLSX.readtable(filename, "solns"))
-# bus_types = DataFrame(XLSX.readtable(filename, "bus_types"))
-# violations = DataFrame(XLSX.readtable(filename, "violations"))
-# analysis_df = perform_analysis(run_info, violations; write_out = true, filename = joinpath(RESULTS_PATH, "$(case_name)/$(delta)_basic_analysis.xlsx"));
+delta = 0.15
+# create analysis df
+filename = joinpath(RESULTS_PATH, "$(case_name)/$delta.xlsx")
+run_info = DataFrame(XLSX.readtable(filename, "run_info"))
+solns = DataFrame(XLSX.readtable(filename, "solns"))
+bus_types = DataFrame(XLSX.readtable(filename, "bus_types"))
+violations = DataFrame(XLSX.readtable(filename, "violations"))
+analysis_df = perform_analysis(run_info, violations; write_out = true, filename = joinpath(RESULTS_PATH, "$(case_name)/$(delta)_basic_analysis.xlsx"));
 
 # pull in analysis df and plot values 
-analysis_df = DataFrame(XLSX.readtable(joinpath(RESULTS_PATH, "$(case_name)/$(delta)_basic_analysis.xlsx"), "basic_analysis"))
-p = plot_bar_graph_features_scaled(analysis_df, ["jac_iters", "swap_iters", "time", "total_violation_mag"])
-display(p)
-
+# analysis_df = DataFrame(XLSX.readtable(joinpath(RESULTS_PATH, "$(case_name)/$(delta)_basic_analysis.xlsx"), "basic_analysis"))
+# p = plot_bar_graph_features_scaled(analysis_df, ["jac_iters", "swap_iters", "time", "total_violation_mag"])
+# display(p)
+# run_info = filter(x -> x["datapoint"] <= 20, run_info)
+# violations = filter(x -> x["datapoint"] <= 20, violations)
+# p1 = feature_heat_map(run_info, "time", title = "time")
+# p2 = feature_heat_map(run_info, "jac_iters"; title = "jacobian iterations")
+# p3 = feature_heat_map(violations, "total_violation_mag"; title = "total violations")
+# combined_plot = plot(p1, p2, p3, 
+#     layout = (1, 3), 
+#     size = (1500, 500), 
+    
+# )
+# display(combined_plot)
 
 
 

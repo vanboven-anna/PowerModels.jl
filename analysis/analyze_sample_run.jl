@@ -101,7 +101,7 @@ test_case, file_pth = create_test_case("case14", 1.53)
 PowerModels.logger_config!("debug")
 nearest_gens = find_nearest_generators_khop(file_pth)
 test_case["pv_pairs"] = nearest_gens
-result = PowerModels.compute_ac_pf_mult_buses(test_case, grainger = true,  swap_technique = "qv_inv", debug = true, obo = true)
+result = PowerModels.compute_ac_pf_mult_buses(test_case, grainger = true,  swap_technique = "sensitivity_score", debug = true, obo = true)
 # plot_cond_det(result);
 # plot_var_vals(test_case, result);
 plot_cond_submatrices(result);

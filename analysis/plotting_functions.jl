@@ -58,3 +58,25 @@ function plot_bar_graph_features_scaled(analysis_df, feature_lst)
     )
     return p
 end
+
+function feature_heat_map(run_info, feature; title = "")
+    # transform into matrix and scale each column
+    df_wide = unstack(run_info, "run_id", "datapoint", feature, combine = last)
+    sort!(df_wide, "run_id")
+    y_data = Float32.(Matrix(select(df_wide, Not("run_id"))))
+    run_ids = df_wide.run_id
+    datapoints = names(select(df_wide, Not(:run_id)))
+
+    h = heatmap(
+        datapoints, 
+        run_ids, 
+        y_data,
+        xlabel = "Datapoint",
+        ylabel = "Run ID",
+        title = title,
+        color = :viridis,  
+        aspect_ratio = :auto
+    )
+    
+    return h
+end

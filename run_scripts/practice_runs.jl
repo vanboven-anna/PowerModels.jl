@@ -50,9 +50,10 @@ function main()
     PowerModels.logger_config!("debug")
     nearest_gens = find_nearest_generators_khop(file_pth)
     test_case["pv_pairs"] = nearest_gens
-    result = PowerModels.compute_ac_pf_mult_buses(test_case, grainger = true,  swap_technique = "nearest_gen", debug = true, obo = false)
+    result = PowerModels.compute_ac_pf_mult_buses(test_case, grainger = true,  swap_technique = "sensitivity_score", debug = true, obo = false)
     return result
 end
+
 
 
 

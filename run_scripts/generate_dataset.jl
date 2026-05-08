@@ -284,6 +284,7 @@ function generate_solutions(case_name, delta, test_case, load_data, file_pth, ru
             XLSX.writetable!(sheet4, Tables.columntable(violations_df))
         end
     end
+    return run_df, soln_df, violations_df, bi_df
 end
 
 function run_pf!(original_test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
@@ -395,9 +396,14 @@ function generate_loads(test_case, num_points, delta, case_name)
     infeas_acopf = 0
     sorted_pairs = sort(collect(test_case["bus"]); by = x -> parse(Int, x.first))
     map_to_bus = [parse(Int64, i) for (i, bus) in sorted_pairs if bus["bus_type"] == 1]
+    iter_counter = 0
     while counter < num_points
         if counter % 5 == 0
-            println("counter = $counter")
+            println("counter = $counter, iterations = $iter_counter")
+        end
+        iter_counter += 1
+        if (iter_counter > 10) & (counter/iter_counter < 0.005)
+            error("not enough feasible samples with this perturbation scheme: only found $counter samples in $iter_counter iterations")
         end
         # perturb test case load 
         loads = zeros(length(test_case["load"]))
@@ -435,7 +441,7 @@ function generate_loads(test_case, num_points, delta, case_name)
 end
 
 function main()
-    CASE_NAME = "case300"
+    CASE_NAME = "case9241_pegase"
     file_pth = joinpath(DATA_PATH, "test_cases/network_info/$CASE_NAME/$(CASE_NAME).m")
     test_case = PowerModels.parse_file(file_pth)
     test_case = prepare_test_case(test_case, CASE_NAME, file_pth)
@@ -445,14 +451,25 @@ function main()
     delta = round(0.85*max_pg/base_load - 1, digits=2)
     delta -= 0.03
 
+    # generate loads 
+    generate_loads(test_case, 5, delta, CASE_NAME)
+
     # pull in loads and generate dataset
-    run_dict = Dict("pf_types" => ["mbuses", "qlim", "baseline"],
-                    "obo" => [0,1], "grainger" => [0,1],
-                    "swap_techniques" => ["nearest_gen", "qv_inv", "sensitivity_score"],
+    # run_dict = Dict("pf_types" => ["mbuses", "qlim", "baseline"],
+    #                 "obo" => [0,1], "grainger" => [0,1],
+    #                 "swap_techniques" => ["nearest_gen", "qv_inv", "sensitivity_score"],
+    #                 # sensitivity_score-specific knobs (0=off, 1=on); other techniques ignore.
+    #                 "use_smw_warmstart"      => [0, 1],
+    #                 "score_collateral_aware" => [0],
+    #             )
+    run_dict = Dict("pf_types" => ["baseline"],
+                    "obo" => [1], "grainger" => [1],
+                    "swap_techniques" => [],
                     # sensitivity_score-specific knobs (0=off, 1=on); other techniques ignore.
-                    "use_smw_warmstart"      => [0, 1],
-                    "score_collateral_aware" => [0],
+                    "use_smw_warmstart"      => [],
+                    "score_collateral_aware" => [],
                 )
     load_data = DataFrame(XLSX.readtable(joinpath(TESTCASE_PATH, "data/$(CASE_NAME)/loads/$delta.xlsx"), "loads"))
-    generate_solutions(CASE_NAME, delta, test_case, load_data, file_pth, run_dict; num_samples = 10, write_out = true)
+    run_df, soln_df, violations_df, bi_df = generate_solutions(CASE_NAME, delta, test_case, load_data, file_pth, run_dict; num_samples = 5, write_out = false)
+    return run_df, soln_df, violations_df, bi_df
 end

@@ -34,20 +34,20 @@ max_pg = sum([gen["pmax"] for gen in values(test_case["gen"])])
 base_load = sum([load["pd"] for load in values(test_case["load"])])
 delta = round(0.85*max_pg/base_load - 1, digits=2)
 delta -= 0.03
-load_data = DataFrame(XLSX.readtable(joinpath(TESTCASE_PATH, "data/$(case_name)/loads/$delta.xlsx"), "loads"))
-data_ind = 5
-loads = load_data[data_ind, :]
-for (load_ind, load) in pairs(test_case["load"])
-    load["pd"] = loads["pd_$load_ind"]
-    load["qd"] = loads["qd_$load_ind"]
-end
-for (gen_ind, gen) in pairs(test_case["gen"])
-    gen["pg"] = loads["pg_$gen_ind"]
-end
+# load_data = DataFrame(XLSX.readtable(joinpath(TESTCASE_PATH, "data/$(case_name)/loads/$delta.xlsx"), "loads"))
+# data_ind = 5
+# loads = load_data[data_ind, :]
+# for (load_ind, load) in pairs(test_case["load"])
+#     load["pd"] = loads["pd_$load_ind"]
+#     load["qd"] = loads["qd_$load_ind"]
+# end
+# for (gen_ind, gen) in pairs(test_case["gen"])
+#     gen["pg"] = loads["pg_$gen_ind"]
+# end
 
 # compute acpf 
 PowerModels.logger_config!("debug")
 nearest_gens = find_nearest_generators_khop(file_pth)
 test_case["pv_pairs"] = nearest_gens
-result = PowerModels.compute_ac_pf_mult_buses(test_case, grainger = true,  swap_technique = "nearest_gen", debug = true, obo = false)
+result = PowerModels.compute_ac_pf_mult_buses(test_case, grainger = true,  swap_technique = "qv_inv", debug = true, obo = false)
 

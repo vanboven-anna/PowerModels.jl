@@ -1108,6 +1108,25 @@ function compute_ac_pf_mult_buses(pf_data::PowerFlowData; kwargs...)
     time_start = time()
     while (~is_feas) & (acpf_counter <= flags.max_acpf)
         @_debug( "computing ac pf, iteration $(acpf_counter)... ")
+        # Bus-type-pair invariant: every PQV recipient (type 5) must have a
+        # matching P-donor (type 6) so that the variable count stays at 2n.
+        # Violating this orphans a recipient or donor, and the next NR call
+        # ends up with a non-square Jacobian.
+        let
+            t5 = [i for (i, bt) in enumerate(pf_data.bus_type_idx) if bt == 5]
+            t6 = [i for (i, bt) in enumerate(pf_data.bus_type_idx) if bt == 6]
+            paired_t5 = Set(values(p_pqv_pairs))
+            paired_t6 = Set(keys(p_pqv_pairs))
+            if length(t5) != length(t6)
+                orphans_t5 = [b for b in t5 if !(b in paired_t5)]
+                orphans_t6 = [b for b in t6 if !(b in paired_t6)]
+                error("bus-type pair invariant broken at outer iter $acpf_counter: " *
+                      "#PQV(type 5)=$(length(t5)) at $t5, " *
+                      "#P-donor(type 6)=$(length(t6)) at $t6, " *
+                      "p_pqv_pairs=$(p_pqv_pairs), " *
+                      "orphan type-5 buses=$orphans_t5, orphan type-6 buses=$orphans_t6")
+            end
+        end
         # variable mapping for jacobian
         mapping_dict, J0_map = map_types_to_variable_indices(pf_data,  grainger = flags.grainger)
         # place the previous solution into the x0 variable
@@ -1332,36 +1351,60 @@ end
 "Swap PV->PQ and P-PQV bus types"
 function perform_bus_swaps!(pf_data, mapping_dict, bus_type_idx, p_pqv_pairs, jacobian,
                             bus_assignment, swap, violations, flags)
-    # unpack violations 
+    # unpack violations
     b1_violations = violations["b1"]
     b2_violations = violations["b2"]
     b6v_violations = violations["b6v"]
     b6q_violations = violations["b6q"]
-    # update q violations first 
+    _check_pair_invariant(pf_data, p_pqv_pairs, "perform_bus_swaps! entry")
+    # update q violations first
     sort_func = flags.highest_mag ? val -> -abs(val) : val -> abs(val)
     all_qs = vcat(b2_violations, b6q_violations)
     sort!(all_qs, by = x -> sort_func(x[4]))
     update_q_violations!(pf_data, all_qs, p_pqv_pairs, flags.obo, swap)
-    if flags.obo & swap[] 
-        return 
-    end    
-    # update the voltage violations at type 6 buses 
+    _check_pair_invariant(pf_data, p_pqv_pairs, "after update_q_violations!")
+    if flags.obo & swap[]
+        return
+    end
+    # update the voltage violations at type 6 buses
     sort!(b6v_violations, by = x -> sort_func(x[2]))
     update_vm_violations!(pf_data, b6v_violations, p_pqv_pairs, flags.obo, swap)
-    if flags.obo & swap[] 
-        return 
-    end 
+    _check_pair_invariant(pf_data, p_pqv_pairs, "after update_vm_violations!")
+    if flags.obo & swap[]
+        return
+    end
     # update the voltage violations at type 1 buses according to swapping technique
     if flags.swap_technique == "qv_inv"
-        perform_bus_swaps_qv_inv!(pf_data, mapping_dict, jacobian, bus_type_idx, p_pqv_pairs, 
+        perform_bus_swaps_qv_inv!(pf_data, mapping_dict, jacobian, bus_type_idx, p_pqv_pairs,
                                     bus_assignment, swap, b1_violations, flags)
+        _check_pair_invariant(pf_data, p_pqv_pairs, "after perform_bus_swaps_qv_inv!")
     elseif flags.swap_technique == "sensitivity_score"
-        perform_bus_swaps_sensitivity_score!(pf_data, mapping_dict, jacobian, bus_type_idx, p_pqv_pairs, 
+        perform_bus_swaps_sensitivity_score!(pf_data, mapping_dict, jacobian, bus_type_idx, p_pqv_pairs,
                             bus_assignment, swap, b1_violations, flags)
-    else 
+        _check_pair_invariant(pf_data, p_pqv_pairs, "after perform_bus_swaps_sensitivity_score!")
+    else
         perform_bus_swaps_nearest_gen!(pf_data, bus_assignment, p_pqv_pairs, b1_violations, swap, flags)
+        _check_pair_invariant(pf_data, p_pqv_pairs, "after perform_bus_swaps_nearest_gen!")
     end
-    
+
+end
+
+# Helper that throws when |type 5| != |type 6| with diagnostic info.
+function _check_pair_invariant(pf_data, p_pqv_pairs, where_str::String)
+    t5 = [i for (i, bt) in enumerate(pf_data.bus_type_idx) if bt == 5]
+    t6 = [i for (i, bt) in enumerate(pf_data.bus_type_idx) if bt == 6]
+    if length(t5) == length(t6)
+        return
+    end
+    paired_t5 = Set(values(p_pqv_pairs))
+    paired_t6 = Set(keys(p_pqv_pairs))
+    orphans_t5 = [b for b in t5 if !(b in paired_t5)]
+    orphans_t6 = [b for b in t6 if !(b in paired_t6)]
+    error("bus-type pair invariant broken [$where_str]: " *
+          "#PQV(5)=$(length(t5)) at $t5, " *
+          "#P-donor(6)=$(length(t6)) at $t6, " *
+          "p_pqv_pairs=$(p_pqv_pairs), " *
+          "orphan type-5=$orphans_t5, orphan type-6=$orphans_t6")
 end
 
 "P_PQV switching methodology based on nearby generators"
@@ -1618,7 +1661,14 @@ function update_pf_data!(pf_data, best_solution)
     update_list!(pf_data.q_inject_idx, best_solution["q_inject_idx"])
     update_list!(pf_data.p_delta_base_idx, best_solution["p_delta_base_idx"])
     update_list!(pf_data.q_delta_base_idx, best_solution["q_delta_base_idx"])
-    
+    # Rebuild pv_bus_inds from the restored bus_type_idx. Without this, a
+    # bus that was type-2 (PV) in the divergent state but is now type-6
+    # (P-donor) in the restored state stays in pv_bus_inds, and a later
+    # forward swap picks it again -- which overwrites p_pqv_pairs[bus] and
+    # silently orphans the prior recipient as type 5 with no donor entry.
+    # The orphan then surfaces as a #type-5 != #type-6 dimension mismatch
+    # in the next NR Jacobian.
+    pf_data.data["pv_bus_inds"] = [i for (i, bt) in enumerate(pf_data.bus_type_idx) if bt == 2]
 end
 
 "Compute AC-Power flow using the methology outlined in Grainger-Stevenson"

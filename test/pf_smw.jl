@@ -163,6 +163,62 @@ end
         @test isapprox(dx_direct, dx_smw; atol = 1e-8, rtol = 1e-8)
     end
 
+    @testset "Relinearization term is not rank-one" begin
+        # Companion to "Proposition 1" / "Theorem 1": those tests verify the
+        # exact identity J_τ'(x*) - J_τ(x*) = e_{r_i}(e_{V_l} - e_{V_i})^T at
+        # the SAME state x*. Once V_l is mutated to its bound (or one Newton
+        # step is taken), the AC PF Jacobian must be re-evaluated at the new
+        # state and picks up a relinearization term J_τ'(x_new) - J_τ'(x*)
+        # that is generally NOT rank one -- because P_m, Q_m for every
+        # neighbor m of l contain V_l*V_m, cos(θ_m-θ_l) etc.
+        #
+        # This test demonstrates that the relinearization term exists, has
+        # rank > 1, and that the changed entries land in rows associated with
+        # neighbors of l. We do NOT use SMW for an exact update across this
+        # state change; SMW is the first Newton predictor only.
+        pf_data, data = _converged_pf_data("../test/data/matpower/case14.m")
+
+        i = findfirst(==(2), pf_data.bus_type_idx)
+        l = findfirst(==(1), pf_data.bus_type_idx)
+        target_Vl = data["bus"][string(pf_data.am.idx_to_bus[l])]["vmin"]
+
+        # J_τ'(x*) -- swap pattern, but state still at x*.
+        pf_data2 = deepcopy(pf_data)
+        pf_data2.bus_type_idx[i] = 6
+        pf_data2.bus_type_idx[l] = 5
+        Jpost_xstar, emap = PowerModels.build_embedded_jacobian(pf_data2, Dict{Int,Int}(i => l))
+
+        # J_τ'(x_new) -- same swap pattern, but recipient pinned to V̂_l.
+        pf_data3 = deepcopy(pf_data2)
+        pf_data3.vm_idx[l] = target_Vl
+        Jpost_xnew, _ = PowerModels.build_embedded_jacobian(pf_data3, Dict{Int,Int}(i => l))
+
+        D_relin = Jpost_xnew - Jpost_xstar
+
+        # Relinearization term is real (V_l moved by a non-trivial amount).
+        @test abs(target_Vl - pf_data.vm_idx[l]) > 1e-3
+        @test maximum(abs, D_relin) > 1e-6
+
+        # Critically, NOT rank one.
+        @test rank(Matrix(D_relin)) > 1
+
+        # Changed rows live in P/Q rows of {l} ∪ neighbors(l). Confirm that
+        # at least one neighbor of l has a non-trivial change in either its
+        # P-row or its aux row (Q row, since the neighbor stays type 1).
+        nbrs_of_l = [m for m in pf_data.neighbors[l] if m != l && haskey(emap.p_row, m)]
+        @test !isempty(nbrs_of_l)
+        neighbor_changed = false
+        for m in nbrs_of_l
+            row_changes = max(maximum(abs, D_relin[emap.p_row[m], :]),
+                              maximum(abs, D_relin[emap.aux_row[m], :]))
+            if row_changes > 1e-6
+                neighbor_changed = true
+                break
+            end
+        end
+        @test neighbor_changed
+    end
+
     @testset "Corollary 1: V_l prediction is exactly satisfied" begin
         pf_data, data = _converged_pf_data("../test/data/matpower/case14.m")
         Jpre, emap = PowerModels.build_embedded_jacobian(pf_data, Dict{Int,Int}())
@@ -196,6 +252,113 @@ end
         max_abs = maximum(abs(z_dict[k][emap.vm_col[l]]) for k in candidates)
         @test isapprox(abs(sens), max_abs; atol = 1e-12)
         @test isapprox(score, max_abs; atol = 1e-12)
+    end
+
+    @testset "score predicts donor quality on case14 first swap" begin
+        # Validate the sensitivity score against ground truth on a real network.
+        # For case14's first swap, fix the recipient l to the PQ bus closest
+        # to a voltage bound; for every PV donor i:
+        #   (a) compute predicted score |e_{V_l}^T J_hat^{-1} e_{r_i}|,
+        #   (b) actually perform the (i, l) swap, run NR to convergence, and
+        #       measure post-swap total |V| violation magnitude.
+        # Assert that the score's top-1 donor lands in the actual top half
+        # and is within a small constant of the oracle's best total |V|.
+        pf_data, data = _converged_pf_data("../test/data/matpower/case14.m")
+
+        # Recipient: PQ bus with smallest distance to either voltage bound.
+        pq_buses = [k for k in 1:length(pf_data.bus_type_idx) if pf_data.bus_type_idx[k] == 1]
+        @test !isempty(pq_buses)
+        function _bound_margin(k)
+            b = data["bus"][string(pf_data.am.idx_to_bus[k])]
+            V = pf_data.vm_idx[k]
+            return min(V - b["vmin"], b["vmax"] - V)
+        end
+        l = argmin(_bound_margin, pq_buses)
+        bus_l = data["bus"][string(pf_data.am.idx_to_bus[l])]
+        Vl_pre = pf_data.vm_idx[l]
+        target_Vl = (Vl_pre - bus_l["vmin"]) < (bus_l["vmax"] - Vl_pre) ? bus_l["vmin"] : bus_l["vmax"]
+
+        # Candidate PV donors (case14 has 4: buses 2, 3, 6, 8).
+        candidates = [k for k in 1:length(pf_data.bus_type_idx) if pf_data.bus_type_idx[k] == 2]
+        @test length(candidates) >= 2
+
+        # Predicted ranking: |e_{V_l}^T J_hat^{-1} e_{r_i}| for each donor.
+        Jhat, emap = PowerModels.build_embedded_jacobian(pf_data, Dict{Int,Int}())
+        z_dict = PowerModels.compute_sensitivity_columns(Jhat, emap, candidates)
+        score = Dict(i => abs(z_dict[i][emap.vm_col[l]]) for i in candidates)
+
+        # Oracle: actually perform each (i, l) swap and measure post-swap state.
+        actual_total = Dict{Int, Float64}()
+        actual_Vl    = Dict{Int, Float64}()
+        for i in candidates
+            pf_i = deepcopy(pf_data)
+            pf_i.bus_type_idx[i] = 6        # PV donor -> P-donor
+            pf_i.bus_type_idx[l] = 5        # PQ recipient -> PQV recipient
+            pf_i.vm_idx[l]       = target_Vl
+            # Warm-start NR from the (post-pin) converged-pre-swap state.
+            for (k, bid) in enumerate(pf_i.am.idx_to_bus)
+                db = pf_i.data["bus"][string(bid)]
+                db["vm_start"] = pf_i.vm_idx[k]
+                db["va_start"] = pf_i.va_idx[k]
+            end
+            mapping_dict, J0_map = PowerModels.map_types_to_variable_indices(pf_i)
+            pf_result, _, _ = PowerModels._compute_ac_pf(pf_i, mapping_dict, J0_map; flat_start = false)
+            converged = pf_result.x_converged || pf_result.f_converged
+            actual_Vl[i] = converged ? pf_i.vm_idx[l] : NaN
+            if !converged
+                actual_total[i] = Inf
+                continue
+            end
+            total = 0.0
+            for k in 1:length(pf_i.bus_type_idx)
+                b = data["bus"][string(pf_i.am.idx_to_bus[k])]
+                V = pf_i.vm_idx[k]
+                V < b["vmin"] && (total += b["vmin"] - V)
+                V > b["vmax"] && (total += V - b["vmax"])
+            end
+            actual_total[i] = total
+        end
+
+        predicted_rank = sort(candidates; by = i -> -score[i])
+        actual_rank    = sort(candidates; by = i -> actual_total[i])
+        best_actual    = actual_total[actual_rank[1]]
+
+        # Also predict via the collateral-aware score (Corollary 1): for each
+        # donor i, predict V_m at every nonslack bus via the linear column
+        # z_i, sum the predicted bound violations, and pick the donor that
+        # minimizes the predicted total. This is supposed to dominate the
+        # local-optimal score on collateral-heavy cases.
+        collat_donor, _, _ = PowerModels.score_collateral_aware(
+            z_dict, emap, pf_data, l, target_Vl; alpha = 0.0)
+
+        println("\n  case14 first-swap donor validation (recipient l = $l, target_Vl = $target_Vl):")
+        for i in candidates
+            si = round(score[i];          sigdigits = 4)
+            vi = round(actual_Vl[i];      digits = 5)
+            ti = round(actual_total[i];   digits = 5)
+            println("    donor=$i  score=$si  actual_Vl=$vi  total|V|_post=$ti")
+        end
+        println("    local-optimal best donor:    $(predicted_rank[1])  (actual total |V| = $(round(actual_total[predicted_rank[1]]; digits=5)))")
+        println("    collateral-aware best donor: $(collat_donor)  (actual total |V| = $(round(actual_total[collat_donor];    digits=5)))")
+        println("    oracle best donor:           $(actual_rank[1])  (actual total |V| = $(round(best_actual;                 digits=5)))")
+
+        # Validation 1 (local-optimal): top-1 lands in the actual top half.
+        topN = max(2, div(length(actual_rank), 2))
+        @test predicted_rank[1] in actual_rank[1:topN]
+
+        # Validation 2 (local-optimal): predicted top-1's actual total |V| is
+        # no worse than 1.25x the oracle's. Local-optimal doesn't directly
+        # minimize collateral, hence the small margin.
+        pred_actual = actual_total[predicted_rank[1]]
+        @test pred_actual <= 1.25 * best_actual + 1e-6
+
+        # Validation 3 (collateral-aware): a strictly tighter check.
+        # Collateral-aware predicts post-swap V at every bus and picks the
+        # donor that minimizes the summed predicted violation -- this is the
+        # quantity the oracle ranks. Assert it matches the oracle exactly OR
+        # is within 1.05x of the oracle's best.
+        collat_actual = actual_total[collat_donor]
+        @test collat_donor == actual_rank[1] || collat_actual <= 1.05 * best_actual + 1e-6
     end
 
     @testset "score_collateral_aware runs and prefers low-collateral donor" begin

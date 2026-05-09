@@ -14,6 +14,21 @@
 #   - Sensitivity of V_l to V_donor at a candidate i:  e_{V_l}^T J^{-1} e_{r_i}.
 #   - Predicted first Newton step:  -(V_l - V_hat_l) / (e_{V_l}^T J^{-1} e_{r_i}) * J^{-1} e_{r_i}.
 #
+# State-of-evaluation invariant (important):
+#   The exact rank-one identity
+#       J_{τ'}(x*) - J_τ(x*)  =  e_{r_i} (e_{V_l} - e_{V_i})^T
+#   holds ONLY when both Jacobians are evaluated at the same state x*. After
+#   `swap_pqv_buses!` mutates `pf_data.vm_idx[recipient]` to the bound, any
+#   re-assembled post-swap Jacobian J_{τ'}(x_new) differs from J_{τ'}(x*) by a
+#   nonlinear relinearization term (P_m, Q_m for every neighbor m of l contain
+#   V_l*V_m, cos(θ_m-θ_l), …) that is generally NOT rank one. We therefore
+#   apply Sherman-Morrison only as the FIRST Newton predictor at the converged
+#   pre-swap x*; NR is then re-entered fresh and rebuilds the reduced-form
+#   Jacobian at every iteration. We do not claim or rely on a rank-one update
+#   between J_τ(x*) and any later post-swap Jacobian.
+#   See `test/pf_smw.jl::"Relinearization term is not rank-one"` for the
+#   demonstration that the relinearization term exists and has rank > 1.
+#
 # The reduced-form NR solver in pf.jl is left untouched. The embedded
 # Jacobian J_hat is built only for screening, factored once per swap
 # decision, and probed with one back-solve per donor candidate.

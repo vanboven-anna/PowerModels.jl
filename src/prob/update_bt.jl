@@ -145,19 +145,19 @@ end
 function swap_pqv_buses!(pf_data, b_violations, swap_gens, p_pqv_pairs, bus_assignment, swap)
     for (b_viol, gen) in zip(b_violations, swap_gens)
         bus, viol, adjust = b_viol
-        # swap bus types 
+        # swap bus types
         update_bus_type!(pf_data, bus, 5)
         update_bus_type!(pf_data, gen, 6)
         append!(pf_data.data["prev_swaps"][bus], gen)
-        swap[] = true 
-        # update vm on pq bus 
+        swap[] = true
+        # update vm on pq bus
         pf_data.vm_idx[bus] = adjust
         bus_assignment[string(pf_data.am.idx_to_bus[bus])]["vm"] = adjust
-        # store pair 
+        # store pair
         p_pqv_pairs[gen] = bus
     end
-    return swap 
-end 
+    return swap
+end
 
 function update_qg!(pf_data, pf_result, bid, gen_assn, mapping)
     for gen in pf_data.bus_gens[bid]

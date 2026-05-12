@@ -196,6 +196,7 @@ Base.@kwdef struct SwapFlags
     mapping = false # for basic PF: use mapping dictionary vs. using indexing
     enforce_q_lims = true # for basic PF: include q lims or not
     obo = false  # one-by-one: can you perform one type-switch each iteration, or multiple?
+    b1_obo = false # if true, cap PV->PQ (b1) batch to one swap per iter even when obo=false
     flat_start = false # flat start each iter vs. warmstart with the prev soln
     max_acpf = 50 # max iters before returning best solution thus far
     minimize_mag = true # minimize violation magnitude vs. number of violations
@@ -1288,7 +1289,13 @@ function compute_ac_pf_mult_buses(pf_data::PowerFlowData; kwargs...)
             # seed the next NR call. solution["bus"] was deep-copied from
             # bus_assignment before the swap, so copy the (possibly updated)
             # values back into solution so warm_start_prev_soln! picks them up.
+            # CRITICAL: update_best_solution! above stored `solution` by
+            # reference. Deepcopy here so the SMW mutation does not retroactively
+            # corrupt the previously-stored best (which is what makes a later
+            # NR pass occasionally appear to land at a worse total-mag state
+            # than baseline -- it doesn't, the stored best just gets mutated).
             if flags.use_smw_warmstart
+                solution = deepcopy(solution)
                 for (s, b) in solution["bus"]
                     if haskey(bus_assignment, s)
                         b["vm"] = bus_assignment[s]["vm"]
@@ -1418,8 +1425,8 @@ function perform_bus_swaps_nearest_gen!(pf_data, bus_assignment, p_pqv_pairs, b1
             continue 
         end 
         push!(swap_gens, pv_bus)
-        if flags.obo 
-            break 
+        if flags.obo || flags.b1_obo
+            break
         end
     end
     # swap buses

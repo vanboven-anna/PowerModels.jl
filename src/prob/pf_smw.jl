@@ -551,7 +551,7 @@ function perform_bus_swaps_sensitivity_score_impl!(pf_data, mapping_dict, jacobi
         smw_mismatches[donor] = -viol[2]
         delete!(available_pv, donor)
 
-        if flags.obo
+        if flags.obo || flags.b1_obo
             break
         end
     end

@@ -1,38 +1,3 @@
-# Run this as a standalone Julia script from the repo root:
-#   julia --project=. --startup-file=no test_scripts/test_cases.jl
-#
-# Restrict to specific cases/datapoints/configs with positional CLI args
-# (each a comma-separated list; omit an arg, or pass "", to leave it
-# unfiltered). Default with no args is the full 66-run sweep:
-#   julia --project=. --startup-file=no test_scripts/test_cases.jl <cases> <datapoints> <configs>
-#
-# Examples:
-#   # everything (default)
-#   julia --project=. --startup-file=no test_scripts/test_cases.jl
-#
-#   # just the 300-bus case, both its datapoints, all 11 configs
-#   julia --project=. --startup-file=no test_scripts/test_cases.jl case300
-#
-#   # one specific (case, datapoint, config) combination
-#   julia --project=. --startup-file=no test_scripts/test_cases.jl case300 14 nearest_gen+no_grainger+no_obo
-#
-#   # re-run only the run that errored with InterruptException during the
-#   # full sweep on 2026-08-24 (case300 dp=14 nearest_gen+no_grainger+no_obo)
-#   julia --project=. --startup-file=no test_scripts/test_cases.jl rerun-failed
-#
-# Or from a Julia REPL started in the repo root:
-#   using Pkg
-#   Pkg.activate(".")
-#   ENV["PM_BUSSWAP_PROGRESS"] = "1"
-#   ENV["PM_BUSSWAP_CASES"] = "case300"                            # optional, comma-separated
-#   ENV["PM_BUSSWAP_DATAPOINTS"] = "14"                            # optional, comma-separated
-#   ENV["PM_BUSSWAP_CONFIGS"] = "nearest_gen+no_grainger+no_obo"   # optional, comma-separated
-#   using Test, PowerModels, JSON
-#   include("test/pf_busswap.jl")
-#
-# This file is intentionally kept as Julia code so it can be used as a
-# lightweight launcher for the bus-swap functional test without depending on the
-# full test/runtests.jl harness.
 
 using Pkg
 

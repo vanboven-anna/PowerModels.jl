@@ -89,6 +89,64 @@ function constraint_power_balance(pm::AbstractACPModel, n::Int, i::Int, bus_arcs
     return cstr_p, cstr_q
 end
 
+"""
+Nodal power-balance constraint for `AbstractACPModel`, identical in form to
+`constraint_power_balance(pm::AbstractACPModel, n, ...)` above, except the
+shunt susceptance term is built from `bs_var` (a `bus_shunts` id => JuMP
+variable map) rather than the shunt's fixed `"bs"` data -- used by
+`build_dc_ac_device_pf` (see prob/opf.jl) where shunt susceptance is a
+decision variable rather than fixed data.
+"""
+function _device_pf_power_balance!(pm::AbstractACPModel, i::Int, bs_var::Dict)
+    bus_arcs = ref(pm, :bus_arcs, i)
+    bus_arcs_dc = ref(pm, :bus_arcs_dc, i)
+    bus_arcs_sw = ref(pm, :bus_arcs_sw, i)
+    bus_gens = ref(pm, :bus_gens, i)
+    bus_loads = ref(pm, :bus_loads, i)
+    bus_shunts = ref(pm, :bus_shunts, i)
+    bus_storage = ref(pm, :bus_storage, i)
+
+    bus_pd = Dict(k => ref(pm, :load, k, "pd") for k in bus_loads)
+    bus_qd = Dict(k => ref(pm, :load, k, "qd") for k in bus_loads)
+    bus_gs = Dict(k => ref(pm, :shunt, k, "gs") for k in bus_shunts)
+    bus_bs = Dict(k => bs_var[k] for k in bus_shunts)
+
+    vm = var(pm, :vm, i)
+    p    = get(var(pm, nw_id_default),    :p, Dict()); _check_var_keys(p, bus_arcs, "active power", "branch")
+    q    = get(var(pm, nw_id_default),    :q, Dict()); _check_var_keys(q, bus_arcs, "reactive power", "branch")
+    pg   = get(var(pm, nw_id_default),   :pg, Dict()); _check_var_keys(pg, bus_gens, "active power", "generator")
+    qg   = get(var(pm, nw_id_default),   :qg, Dict()); _check_var_keys(qg, bus_gens, "reactive power", "generator")
+    ps   = get(var(pm, nw_id_default),   :ps, Dict()); _check_var_keys(ps, bus_storage, "active power", "storage")
+    qs   = get(var(pm, nw_id_default),   :qs, Dict()); _check_var_keys(qs, bus_storage, "reactive power", "storage")
+    psw  = get(var(pm, nw_id_default),  :psw, Dict()); _check_var_keys(psw, bus_arcs_sw, "active power", "switch")
+    qsw  = get(var(pm, nw_id_default),  :qsw, Dict()); _check_var_keys(qsw, bus_arcs_sw, "reactive power", "switch")
+    p_dc = get(var(pm, nw_id_default), :p_dc, Dict()); _check_var_keys(p_dc, bus_arcs_dc, "active power", "dcline")
+    q_dc = get(var(pm, nw_id_default), :q_dc, Dict()); _check_var_keys(q_dc, bus_arcs_dc, "reactive power", "dcline")
+
+    cstr_p = JuMP.@constraint(pm.model,
+        sum(p[a] for a in bus_arcs)
+        + sum(p_dc[a_dc] for a_dc in bus_arcs_dc)
+        + sum(psw[a_sw] for a_sw in bus_arcs_sw)
+        ==
+        sum(pg[g] for g in bus_gens)
+        - sum(ps[s] for s in bus_storage)
+        - sum(pd for (_, pd) in bus_pd)
+        - sum(gs for (_, gs) in bus_gs)*vm^2
+    )
+
+    cstr_q = JuMP.@constraint(pm.model,
+        sum(q[a] for a in bus_arcs)
+        + sum(q_dc[a_dc] for a_dc in bus_arcs_dc)
+        + sum(qsw[a_sw] for a_sw in bus_arcs_sw)
+        ==
+        sum(qg[g] for g in bus_gens)
+        - sum(qs[s] for s in bus_storage)
+        - sum(qd for (_, qd) in bus_qd)
+        + sum(bs for (_, bs) in bus_bs)*vm^2
+    )
+    return cstr_p, cstr_q
+end
+
 function constraint_power_balance_ls(pm::AbstractACPModel, n::Int, i::Int, bus_arcs, bus_arcs_dc, bus_arcs_sw, bus_gens, bus_storage, bus_pd, bus_qd, bus_gs, bus_bs)
     vm   = var(pm, n, :vm, i)
     p    = get(var(pm, n),    :p, Dict()); _check_var_keys(p, bus_arcs, "active power", "branch")
@@ -237,6 +295,56 @@ function constraint_ohms_yt_to(pm::AbstractACPModel, n::Int, f_bus, t_bus, f_idx
 
     yttp = JuMP.@constraint(pm.model,p_to ==  (g+g_to)*vm_to^2 + (-g*tr-b*ti)/tm^2*(vm_to*vm_fr*cos(va_to-va_fr)) + (-b*tr+g*ti)/tm^2*(vm_to*vm_fr*sin(va_to-va_fr)))
     yttq = JuMP.@constraint(pm.model,q_to == -(b+b_to)*vm_to^2 - (-b*tr+g*ti)/tm^2*(vm_to*vm_fr*cos(va_to-va_fr)) + (-g*tr-b*ti)/tm^2*(vm_to*vm_fr*sin(va_to-va_fr)))
+    return yttp, yttq
+end
+
+"""
+Ohm's-law "from" constraint for `AbstractACPModel`, identical in form to
+`constraint_ohms_yt_from(pm::AbstractACPModel, n, ...)` above, except
+`tr`/`ti`/`tm` are passed in directly rather than being derived from fixed
+branch data -- so they may be JuMP variables (for a device whose tap or
+shift is a decision variable) or plain numbers (fixed, as usual). Used by
+`build_dc_ac_device_pf` (see prob/opf.jl).
+"""
+function _device_pf_ohms_yt_from!(pm::AbstractACPModel, i::Int, tr, ti, tm)
+    branch = ref(pm, :branch, i)
+    f_bus, t_bus = branch["f_bus"], branch["t_bus"]
+    f_idx, t_idx = (i, f_bus, t_bus), (i, t_bus, f_bus)
+    g, b = calc_branch_y(branch)
+    g_fr, b_fr = branch["g_fr"], branch["b_fr"]
+
+    p_fr  = var(pm, :p, f_idx)
+    q_fr  = var(pm, :q, f_idx)
+    vm_fr = var(pm, :vm, f_bus)
+    vm_to = var(pm, :vm, t_bus)
+    va_fr = var(pm, :va, f_bus)
+    va_to = var(pm, :va, t_bus)
+
+    ytfp = JuMP.@constraint(pm.model, p_fr ==  (g+g_fr)/tm^2*vm_fr^2 + (-g*tr+b*ti)/tm^2*(vm_fr*vm_to*cos(va_fr-va_to)) + (-b*tr-g*ti)/tm^2*(vm_fr*vm_to*sin(va_fr-va_to)))
+    ytfq = JuMP.@constraint(pm.model,  q_fr == -(b+b_fr)/tm^2*vm_fr^2 - (-b*tr-g*ti)/tm^2*(vm_fr*vm_to*cos(va_fr-va_to)) + (-g*tr+b*ti)/tm^2*(vm_fr*vm_to*sin(va_fr-va_to)))
+    return ytfp, ytfq
+end
+
+"""
+Ohm's-law "to" constraint for `AbstractACPModel`, the `_device_pf_ohms_yt_from!`
+counterpart of `constraint_ohms_yt_to(pm::AbstractACPModel, n, ...)` above.
+"""
+function _device_pf_ohms_yt_to!(pm::AbstractACPModel, i::Int, tr, ti, tm)
+    branch = ref(pm, :branch, i)
+    f_bus, t_bus = branch["f_bus"], branch["t_bus"]
+    f_idx, t_idx = (i, f_bus, t_bus), (i, t_bus, f_bus)
+    g, b = calc_branch_y(branch)
+    g_to, b_to = branch["g_to"], branch["b_to"]
+
+    p_to  = var(pm, :p, t_idx)
+    q_to  = var(pm, :q, t_idx)
+    vm_fr = var(pm, :vm, f_bus)
+    vm_to = var(pm, :vm, t_bus)
+    va_fr = var(pm, :va, f_bus)
+    va_to = var(pm, :va, t_bus)
+
+    yttp = JuMP.@constraint(pm.model, p_to ==  (g+g_to)*vm_to^2 + (-g*tr-b*ti)/tm^2*(vm_to*vm_fr*cos(va_to-va_fr)) + (-b*tr+g*ti)/tm^2*(vm_to*vm_fr*sin(va_to-va_fr)))
+    yttq = JuMP.@constraint(pm.model, q_to == -(b+b_to)*vm_to^2 - (-b*tr+g*ti)/tm^2*(vm_to*vm_fr*cos(va_to-va_fr)) + (-g*tr-b*ti)/tm^2*(vm_to*vm_fr*sin(va_to-va_fr)))
     return yttp, yttq
 end
 

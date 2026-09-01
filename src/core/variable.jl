@@ -283,7 +283,7 @@ function variable_gen_power_real(pm::AbstractPowerModel; nw::Int=nw_id_default, 
     report && sol_component_value(pm, nw, :gen, :pg, ids(pm, nw, :gen), pg)
     # remove slack bus 
     slack_bus = [bus["bus_i"] for (i, bus) in ref(pm, nw, :bus) if bus["bus_type"] == 3][1]
-    pg_sps = ["pg_start" in keys(gen) ? gen["pg_start"] : 0 for (i, gen) in ref(pm, nw, :gen) if !(gen["gen_bus"] in slack_bus)]
+    pg_sps = ["pg_start" in keys(gen) ? gen["pg_start"] : ("pg" in keys(gen) ? gen["pg"] : 0) for (i, gen) in ref(pm, nw, :gen) if !(gen["gen_bus"] in slack_bus)]
     pg_ns = [pg[i] for (i, gen) in ref(pm, nw, :gen) if !(gen["gen_bus"] in slack_bus)]
 
     return pg_ns, pg_sps

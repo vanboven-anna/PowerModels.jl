@@ -30,9 +30,13 @@ file_pth = joinpath(DATA_PATH, "test_cases/data/$case_name/$dataset_name/0.json"
 test_case = PowerModels.parse_file(file_pth)
 test_case = prepare_test_case(test_case, case_name, file_pth)
 
-#  compute ac opf setpoint dist 
+#  compute ac opf setpoint dist
+# prepare_transformer_adjustments, apply_solution!, and solve_dc_ac_pf!
+# (the device=true pipeline: prepare -> solve_dc_ac_device_pf -> apply the
+# solution, snapping tap/shift to their nearest setpoint -> re-solve
+# solve_dc_ac_pf against those now-fixed values) now live in generate_dataset.jl
 ipopt = Ipopt.Optimizer
-result = PowerModels.solve_dc_ac_pf(test_case, ipopt)
+solve_dc_ac_pf!(test_case, ipopt; device = true)
 
 
 # # compute acpf 

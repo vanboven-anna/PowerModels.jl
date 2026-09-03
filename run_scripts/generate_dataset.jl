@@ -8,11 +8,11 @@ include("./find_nearest_gens.jl")
 push!(LOAD_PATH, DATA_PATH)
 using Infiltrator
 Infiltrator.toggle_async_check(false)
-# using DataFrames
-using OrderedCollections 
+using DataFrames
+using OrderedCollections
 using DataStructures
 using JSON
-# using XLSX
+using XLSX
 using Ipopt
 using Infiltrator
 using JuMP
@@ -21,7 +21,6 @@ using LinearAlgebra
 using Distributions
 using Random
 using Graphs
-using Distributed
 Random.seed!(2)
 
 function _determine_acpf_feasibility(test_case, viol_dict; epsilon=1e-5)
@@ -512,6 +511,243 @@ function perturb_shift!(test_case, eligible_ids; max_steps::Integer = 10, shift_
     return test_case
 end
 
+"""
+Add tap/shift tuning bounds and discrete setpoint grids to the branches in
+`tap_ids`/`shift_ids` (the tap-changing/phase-shifting branch IDs from
+`classify_transformers`), and shunt susceptance bounds to every shunt, for
+use by `PowerModels.build_dc_ac_device_pf`. Every flagged branch shares the
+same physical tap-changer/phase-shifter setpoint grid, centered on nominal
+(tap = 1, shift = 0) rather than that branch's own tap/shift -- e.g.
+`tap_setpoints = [0.90, 0.9075, 0.915, ..., 1.095]`,
+`shift_setpoints = [-0.3, -0.25, ..., 0.3]` -- since real tap-changer
+positions are fixed steps around nominal, the same for every transformer of
+a given design, regardless of where a particular one currently sits. Shunt
+`bmin`/`bmax` stay relative to each shunt's own `bs` (susceptance has no
+equivalent fixed physical grid here); `minmax(...)` guards against the
+bounds coming out reversed when `bs` is negative. Mutates and returns
+`test_case`.
+"""
+function prepare_transformer_adjustments(test_case, tap_ids, shift_ids)
+    tap_range = 0.1
+    shift_range = 0.3
+    shunt_range = 0.4
+    tap_step = 0.0075
+    shift_step = 0.05
+
+    tap_setpoints = round.(1 .+ collect(range(-tap_range, tap_range; step = tap_step)); digits = 4)
+    shift_setpoints = round.(collect(range(-shift_range, shift_range; step = shift_step)); digits = 4)
+    tmin, tmax = extrema(tap_setpoints)
+    smin, smax = extrema(shift_setpoints)
+
+    for l in tap_ids
+        branch = test_case["branch"][l]
+        branch["is_tap"] = true
+        branch["tmin"], branch["tmax"] = tmin, tmax
+        branch["tap_setpoints"] = copy(tap_setpoints)
+    end
+    for l in shift_ids
+        branch = test_case["branch"][l]
+        branch["is_shift"] = true
+        branch["smin"], branch["smax"] = smin, smax
+        branch["shift_setpoints"] = copy(shift_setpoints)
+    end
+    for shunt in values(test_case["shunt"])
+        shunt["bmin"], shunt["bmax"] = minmax(shunt["bs"]*(1 - shunt_range), shunt["bs"]*(1 + shunt_range))
+    end
+
+    return test_case
+end
+
+"""
+    apply_solution!(test_case, result)
+
+Writes a `PowerModels` OPF/PF `result`'s solution back into `test_case`: bus
+`vm`/`va`, gen `pg`/`qg` (with `vg` updated to the solved `vm` at that
+generator's bus -- the AC-feasible point a setpoint-distance objective like
+`build_dc_ac_pf`/`build_dc_ac_device_pf` converged to), and, for any branch
+carrying a solved `tap`/`shift` (i.e. one `build_dc_ac_device_pf` treated as
+tunable, per `prepare_transformer_adjustments`), that branch's `tap`/`shift`
+snapped to the nearest entry in its `tap_setpoints`/`shift_setpoints` grid.
+Reusable across any solve whose solution has this "bus"/"gen"/"branch" shape
+-- the tap/shift snap is simply skipped for a branch/result that doesn't
+carry it. Iterates over `solution`'s components, not `test_case`'s: PowerModels
+only includes *active* buses/gens/branches in a solution (an out-of-service
+generator, e.g. one `pert_genstatus!` turned off, or an islanded bus, never
+gets a variable and so is simply absent from `solution`, even though it's
+still listed in `test_case`) -- so a component missing from `solution` is
+left as-is in `test_case` rather than raising a `KeyError`. Mutates and
+returns `test_case`.
+"""
+function apply_solution!(test_case, result)
+    solution = result["solution"]
+
+    for (i, val) in solution["bus"]
+        bus = test_case["bus"][i]
+        bus["vm"] = val["vm"]
+        bus["va"] = val["va"]
+    end
+
+    for (i, val) in solution["gen"]
+        gen = test_case["gen"][i]
+        gen["pg"] = val["pg"]
+        gen["qg"] = val["qg"]
+        gen["vg"] = solution["bus"][string(gen["gen_bus"])]["vm"]
+    end
+
+    for (i, val) in solution["branch"]
+        branch = test_case["branch"][i]
+        if get(branch, "is_tap", false) && haskey(val, "tap")
+            branch["tap"] = argmin(sp -> abs(sp - val["tap"]), branch["tap_setpoints"])
+        end
+        if get(branch, "is_shift", false) && haskey(val, "shift")
+            branch["shift"] = argmin(sp -> abs(sp - val["shift"]), branch["shift_setpoints"])
+        end
+    end
+
+    return test_case
+end
+
+"""
+    solve_dc_ac_pf!(test_case, optimizer; device::Bool = false)
+
+Solves for the AC-feasible operating point closest to the generator voltage
+setpoints in `test_case` (`PowerModels.solve_dc_ac_pf`), writing the solution
+back into `test_case` via `apply_solution!`.
+
+If `device = true`, first solves the same problem but also letting
+transformer tap/shift (and shunt susceptance) move continuously
+(`PowerModels.solve_dc_ac_device_pf`, after flagging the tunable branches via
+`classify_transformers` + `prepare_transformer_adjustments`), and applies
+that solution -- which snaps the solved tap/shift to the nearest entry in
+their discrete setpoint grid. Only then is the plain (non-device) problem
+solved and applied: `build_dc_ac_device_pf` optimizes tap/shift as
+continuous and knows nothing about the discrete grid, so this final resolve
+-- now against the branches' snapped, fixed tap/shift -- is what actually
+finds the best AC-feasible point given those discretized values.
+
+Returns `(test_case, result)` -- `result` is the *final* (non-device) solve's
+full `PowerModels` result dict (`"termination_status"`, `"objective"`,
+`"solve_time"`, ...), since that's the solve whose solution ends up in
+`test_case`.
+"""
+function solve_dc_ac_pf!(test_case, optimizer; device::Bool = false)
+    if device
+        tap_ids, shift_ids = classify_transformers(test_case)
+        prepare_transformer_adjustments(test_case, tap_ids, shift_ids)
+        device_result = PowerModels.solve_dc_ac_device_pf(test_case, optimizer)
+        apply_solution!(test_case, device_result)
+        # `build_dc_ac_device_pf`, like `build_dc_ac_pf`, stashes its
+        # soft-bound relaxation info in `pm.data["soft_bound_penalty_dict"]`
+        # -- and `pm.data` *is* `test_case` (PowerModels doesn't copy it), so
+        # this leaks a `Dict{MOI.ConstraintIndex, ...}` into test_case that
+        # isn't JSON-serializable. Drop it now so it doesn't carry into the
+        # next solve's data or into a caller that persists test_case.
+        delete!(test_case, "soft_bound_penalty_dict")
+    end
+    result = PowerModels.solve_dc_ac_pf(test_case, optimizer)
+    apply_solution!(test_case, result)
+    delete!(test_case, "soft_bound_penalty_dict")
+    return test_case, result
+end
+
+"""
+    generate_optimal_dataset(dataset_path; device::Bool = false, log_level::String = "warn")
+
+For every `<n>.json` case file directly inside `dataset_path/baseline_acpf`
+(the raw, unsolved cases -- see `move_to_baseline_acpf`; same
+`^\\d+\\.json\$` naming convention `store_datapoint!`/`generate_data` write),
+parses it, solves it with `solve_dc_ac_pf!(...; device = device)`, and writes
+the resulting test case to `<dataset_path>/dc_ac_device_pf/<n>.json` when
+`device = true`, or `<dataset_path>/dc_ac_pf/<n>.json` otherwise -- a sibling
+of `baseline_acpf`, not nested inside it -- always under the exact same
+`<n>.json` filename the input case file had, so e.g. `1.json` in
+`baseline_acpf/`, `dc_ac_pf/`, and `dc_ac_device_pf/` are all the same
+underlying case, and a later comparison across those directories can just
+pull matching filenames.
+
+A case whose final solve doesn't reach `LOCALLY_SOLVED` is skipped (not
+written) rather than persisting an unconverged operating point -- which means
+that case's filename simply won't exist in `out_dir`, even though it does in
+`baseline_acpf` (and possibly in the *other* device-flag's output directory,
+if that one converged). Skipped filenames are printed (not just a count) so
+that's visible before it surprises a later cross-directory pull.
+
+Also writes `metadata.xlsx` into `out_dir`, one row per *attempted* case file
+(including skipped ones -- `datapoint` is the only column guaranteed to line
+up with what actually landed in `out_dir`) with:
+  - `datapoint`: the case's numeric filename, e.g. `7` for `7.json`
+  - `feasible`: `true` only if the final solve reached `LOCALLY_SOLVED` *and*
+    the resulting point has zero real AC-PF violations per
+    `_determine_acpf_feasibility` -- `solve_dc_ac_pf`/`solve_dc_ac_device_pf`
+    keep qg/vm bounds *soft* (penalized, not enforced), so `LOCALLY_SOLVED`
+    alone doesn't mean those bounds actually held
+  - `time`: wall-clock seconds spent inside `solve_dc_ac_pf!` for that case
+    -- for `device = true` this covers *both* optimization calls (the device
+    solve and the final resolve), not just the last one
+  - `objective`: the final (non-device) solve's objective value
+
+Returns the output directory path.
+"""
+function generate_optimal_dataset(dataset_path; device::Bool = false, log_level::String = "error")
+    PowerModels.logger_config!(log_level)
+    # see the matching comment in generate_data: Ipopt's console output is a
+    # separate channel from PowerModels' logger, controlled by its own
+    # "print_level" option, not by `PowerModels.logger_config!`
+    ipopt_print_level = log_level == "error" ? 0 : 1
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer, "print_level" => ipopt_print_level)
+
+    in_dir = joinpath(dataset_path, "baseline_acpf")
+    out_dir = joinpath(dataset_path, device ? "dc_ac_device_pf" : "dc_ac_pf")
+    mkpath(out_dir)
+
+    case_files = filter(f -> occursin(r"^\d+\.json$", f), readdir(in_dir))
+
+    metadata = DataFrame(datapoint = Int[], feasible = Bool[], time = Float64[], objective = Float64[])
+
+    written, skipped = 0, String[]
+    for (processed, f) in enumerate(case_files)
+        datapoint = parse(Int, splitext(f)[1])
+        test_case = PowerModels.parse_file(joinpath(in_dir, f))
+        # write the solved case out under the same filename `f` it came in
+        # under (see docstring) -- never renumbered/reindexed
+        local result
+        elapsed = @elapsed (test_case, result) = solve_dc_ac_pf!(test_case, ipopt; device = device)
+        solved = result["termination_status"] == LOCALLY_SOLVED
+        # `_determine_acpf_feasibility` checks the real (hard) AC-PF limits
+        # against test_case's now-solved vm/va/pg/qg -- separate from
+        # `solved`, since qg/vm bounds are only ever *soft* in these builds
+        feasible = solved && _determine_acpf_feasibility(test_case, Dict())["total_violations"] == 0
+        push!(metadata, (datapoint, feasible, elapsed, result["objective"]))
+
+        if !solved
+            push!(skipped, f)
+        else
+            # pretty-print (4-space indent) so the file is easy to read by eye; keeps
+            # the same Inf/NaN -> "null" handling PowerModels.export_file uses so the
+            # file still round-trips through PowerModels.parse_file
+            JSON.json(joinpath(out_dir, f), test_case; pretty = 4, allownan = true, inf = "null", ninf = "null", nan = "null")
+            written += 1
+        end
+
+        if processed % 50 == 0
+            println("generate_optimal_dataset: processed $processed/$(length(case_files)) (written $written, skipped $(length(skipped))) -- $out_dir")
+        end
+    end
+
+    metadata_path = joinpath(out_dir, "metadata.xlsx")
+    isfile(metadata_path) && rm(metadata_path)
+    XLSX.openxlsx(metadata_path, mode = "w") do xf
+        sheet = XLSX.addsheet!(xf, "metadata")
+        XLSX.writetable!(sheet, Tables.columntable(metadata))
+    end
+
+    println("generate_optimal_dataset: wrote $written cases to $out_dir")
+    if !isempty(skipped)
+        println("generate_optimal_dataset: skipped $(length(skipped)) unconverged case(s), missing from $out_dir: $(sort(skipped))")
+    end
+    return out_dir
+end
+
 function _verify_loads_(test_case, loads, max_gen, min_gen, max_pd; qd_loads = nothing, max_qg = nothing, min_qg = nothing)
     # check total load 
     if (sum(loads) > max_gen) || (sum(loads) < min_gen)
@@ -880,32 +1116,14 @@ end
 
 """
 Run one perturb + DC-OPF-feasibility + AC-PF-feasibility attempt, starting
-from a fresh copy of `base_case`. Self-contained apart from its own local
-`Random` draws, which are seeded internally from `seed` first thing -- what
-makes `generate_data` safe to parallelize across worker processes via `pmap`
-below is that every attempt is fully independent of every other, not any
-promise about the exact random numbers each attempt draws: seeding fixes the
-*starting point* of the RNG stream, but several perturbation functions below
-draw via `shuffle(collect(keys(dict)))` or consume a variable number of
-random draws depending on a float sum (e.g. `perturb_load!`'s retry count
-depends on `max_gen`/`max_pd`, which are sums over `values(dict)`), so if a
-`Dict`'s iteration order isn't bit-for-bit identical after being serialized
-to a worker process, the specific perturbation choices for a given `seed`
-can end up different on a worker than they'd have been run locally. In
-practice this means: parallelizing changes *which* buses/lines/generators a
-given attempt index happens to perturb, not whether the resulting datapoint
-is valid -- don't expect a serial run and a parallel run to produce
-bit-identical output files for the same `seed`.
+from a fresh copy of `base_case`. Seeded internally from `seed` first thing,
+so a given attempt index always draws the same perturbation regardless of
+when/how often `generate_data` has been called before it.
 
 Returns `(:success, pert_case, solution)` on a feasible attempt, or
 `(:dcopf_infeasible,)` / `(:acpf_infeasible,)` on failure at that stage.
 """
 function _generate_one_attempt(base_case, max_pd, pert_config, tap_changing_ids, phase_shifting_ids, ipopt, grainger, seed, log_level)
-    # PowerModels' logger level is per-process state (a `Ref` inside the
-    # PowerModels module), not something `generate_data`'s own
-    # `logger_config!` call can reach on a separate worker process -- so it
-    # has to be set again here, every time, regardless of which process
-    # (main or a pmap worker) ends up running this attempt.
     PowerModels.logger_config!(log_level)
     Random.seed!(seed)
     # start every attempt from a fresh copy of the unperturbed base case
@@ -954,22 +1172,10 @@ end
 """
     generate_data(test_case, num_points, case_name, out_name; kwargs...)
 
-Generates up to `2*num_points` perturbation attempts, in batches, via
-`pmap` -- each attempt is dispatched to whichever worker process
-(`Distributed.addprocs`) is free next, or run on this process if none have
-been added (`nprocs() == 1`, the default), which is what makes this
-transparently faster with more workers without needing to change how it's
-called. `pmap` preserves input order in its results, so batches are written
-out in the same deterministic order regardless of which worker actually
-computed which attempt, or how long each one took -- though which attempts
-those actually are (which buses/lines/generators end up perturbed for a
-given attempt index) can still differ between a serial and a parallel run;
-see the caveat on `_generate_one_attempt` above.
-
-To actually use extra worker processes: start Julia with `julia -p N
---project=.` (or call `addprocs(N)` yourself), then `@everywhere
-include("run_scripts/generate_dataset.jl")` instead of a plain `include(...)`
-so every worker has the functions it needs.
+Generates up to `2*num_points` perturbation attempts, one at a time (via
+`_generate_one_attempt`), stopping once `num_points` feasible datapoints have
+been written or `2*num_points` attempts have been made, whichever comes
+first.
 """
 function generate_data(test_case, num_points, case_name, out_name; pert_config_path::Union{Nothing, AbstractString} = "default_pert.json", log_level::String = "warn", grainger::Bool = true)
     PowerModels.logger_config!(log_level)
@@ -1011,103 +1217,46 @@ function generate_data(test_case, num_points, case_name, out_name; pert_config_p
     infeas_acpf = 0
     total_counter = 0
     max_attempts_total = 2 * num_points
-    # cap each pmap batch instead of ever submitting the full remaining
-    # `num_points` (up to 1000, per `main()`'s usage) in one call: `pmap`
-    # only returns once its *entire* batch finishes, even though it only
-    # runs ~nworkers() attempts concurrently -- so an uncapped batch means
-    # every successful attempt's full solved case sits held in memory,
-    # unwritten and ungarbage-collected, until the whole batch completes. A
-    # small multiple of the current worker count keeps workers fed without
-    # accumulating an unbounded amount of solved-case data before any of it
-    # reaches disk via store_datapoint!.
-    max_batch_size = max(nworkers(), 1) * 4
     while counter < num_points && total_counter < max_attempts_total
-        batch_size = min(num_points - counter, max_attempts_total - total_counter, max_batch_size)
-        # attempt seeds are just the attempt's position in the overall
-        # sequence, so the batch boundaries (and therefore the number of
-        # worker processes in use) never change what any individual attempt
-        # draws
-        seeds = (total_counter + 1):(total_counter + batch_size)
-        results = pmap(seed -> _generate_one_attempt(base_case, max_pd, pert_config,
-                            tap_changing_ids, phase_shifting_ids, ipopt, grainger, seed, log_level),
-                        seeds)
-        for result in results
-            total_counter += 1
-            if result[1] == :dcopf_infeasible
-                infeas_dcopf += 1
-            elseif result[1] == :acpf_infeasible
-                infeas_acpf += 1
-            else
-                _, pert_case, solution = result
-                store_datapoint!(pert_case, solution, curr_samps + counter, out_dir)
-                counter += 1
-            end
+        total_counter += 1
+        result = _generate_one_attempt(base_case, max_pd, pert_config,
+                        tap_changing_ids, phase_shifting_ids, ipopt, grainger, total_counter, log_level)
+        if result[1] == :dcopf_infeasible
+            infeas_dcopf += 1
+        elseif result[1] == :acpf_infeasible
+            infeas_acpf += 1
+        else
+            _, pert_case, solution = result
+            store_datapoint!(pert_case, solution, curr_samps + counter, out_dir)
+            counter += 1
         end
-        println("counter = $counter, dcopf_counter = $infeas_dcopf, acpf_counter = $infeas_acpf, total = $total_counter")
+        if total_counter % 10 == 0
+            println("counter = $counter, dcopf_counter = $infeas_dcopf, acpf_counter = $infeas_acpf, total = $total_counter")
+        end
     end
     println("generate_data: wrote $counter datapoints (indices $curr_samps:$(curr_samps + counter - 1)) to $out_dir ($infeas_dcopf dcopf-infeasible, $infeas_acpf acpf-infeasible skipped)")
     return counter
 end
 
-"""
-    main(; num_workers = 0)
-
-`num_workers` is the number of *worker processes* to add (via
-`Distributed.addprocs`) before running the case loop below. This is process
-count, not thread count -- Julia's thread count is fixed when the process
-starts (`-t N` / `JULIA_NUM_THREADS`) and can't be changed once a session is
-running, so there's nothing `main()` can do about threads at this point; only
-worker *processes* can be added dynamically like this.
-
-Those workers are only ever used inside `generate_data`'s internal `pmap`
-calls -- nothing else in `main()` (parsing, `prepare_test_case`,
-`PowerModels.logger_config!`, ...) runs anywhere but this process. Workers
-are added once (skipped if already present from an earlier `main()` call in
-this session) and left running afterward rather than torn down, so calling
-`main()` again in the same session reuses them instead of paying the
-startup cost twice.
-"""
-function main(; num_workers::Integer = 0)
-    if num_workers > 0
-        # nworkers() is 1 (not 0) when no processes have been added yet --
-        # Distributed's convention is that the calling process counts as its
-        # own sole "worker" until real ones exist
-        current_workers = nprocs() == 1 ? 0 : nworkers()
-        n_to_add = num_workers - current_workers
-        if n_to_add > 0
-            addprocs(n_to_add; exeflags = "--project=$(Base.active_project())")
-            @everywhere include(@__FILE__)
-        end
-    end
-    if nprocs() > 1
-        # Every process (main and every worker) defaults to its own BLAS
-        # thread pool sized to the machine's core count, used heavily by
-        # Ipopt's sparse factorizations and the AC-PF solver's Newton
-        # iterations -- exactly the expensive part of each attempt. With
-        # several processes all doing that at once, each independently
-        # spinning up many BLAS threads, you get severe oversubscription
-        # (e.g. 3 processes x 8 threads each = 24 threads fighting over 8
-        # cores), which can make each individual solve dramatically SLOWER
-        # than running one process with the whole machine to itself. Capping
-        # every process to 1 BLAS thread keeps the parallelism at the
-        # process level (where it's actually safe/isolated) instead of
-        # double-parallelizing at the thread level too.
-        @everywhere LinearAlgebra.BLAS.set_num_threads(1)
-    end
+function main()
     PowerModels.logger_config!("error")
-    for CASE_NAME in ["case2869_pegase" ]
-        println("running $CASE_NAME...")
+    PERT_NAME = "extreme_pert"
+    for CASE_NAME in [ "case7336"]
+        file_pth = joinpath(DATA_PATH, "test_cases/data/$CASE_NAME/$PERT_NAME")
+        println("running opf for case $CASE_NAME (no device)...")
+        generate_optimal_dataset(file_pth; device=false)
+        println("running opf for case $CASE_NAME (device)...")
+        generate_optimal_dataset(file_pth; device=true)
+    end
+
+    for CASE_NAME in ["case300","case2869_pegase" ]
+        println("generating data for $CASE_NAME...")
         # CASE_NAME = "case7336"
         PERT_NAME = "extreme_pert"
         file_pth = joinpath(DATA_PATH, "test_cases/network_info/$CASE_NAME/$(CASE_NAME).m")
         test_case = PowerModels.parse_file(file_pth)
         test_case = prepare_test_case(test_case, CASE_NAME, file_pth)
-        # log_level must be passed explicitly: generate_data calls
-        # PowerModels.logger_config!(log_level) itself at its own start, and
-        # that kwarg defaults to "warn" -- without passing it here, every
-        # call to generate_data silently resets the logger level this
-        # function just set above, right back to "warn"
-        counter = generate_data(test_case, 500, CASE_NAME, PERT_NAME;
+        counter = generate_data(test_case, 1000, CASE_NAME, PERT_NAME;
                             pert_config_path="$PERT_NAME.json",
                             log_level = "error"
                             )

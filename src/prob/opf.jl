@@ -172,6 +172,12 @@ tap/shift/bs on top of the generator voltage-setpoint term
 left unbounded otherwise; `bs` is bounded by `shunt["bmin"]/["bmax"]` when
 present, unbounded otherwise. Unlike the `qg`/`vm` bounds inherited from
 `build_dc_ac_pf`, these are hard bounds, not soft/penalized ones.
+
+The solved `tap`/`shift`/`bs` values are written into the result's
+`"solution"` dict (`solution["branch"][i]["tap"/"shift"]`,
+`solution["shunt"][i]["bs"]`) alongside the usual `pf`/`qf`/`vm`/etc., so
+callers can read the continuous device setpoints straight off a successful
+solve.
 """
 function build_dc_ac_device_pf(pm::AbstractPowerModel)
     vm, va = variable_bus_voltage(pm; bounded = false)
@@ -223,6 +229,18 @@ function build_dc_ac_device_pf(pm::AbstractPowerModel)
         end
         bs_var[i] = v
         bs_sps[i] = shunt["bs"]
+    end
+
+    # expose the solved device setpoints in the result, same convention the
+    # stock `variable_*` functions use (see `sol_component_value` above)
+    for (i, v) in tap_var
+        sol(pm, nw_id_default, :branch, i)["tap"] = v
+    end
+    for (i, v) in shift_var
+        sol(pm, nw_id_default, :branch, i)["shift"] = v
+    end
+    for (i, v) in bs_var
+        sol(pm, nw_id_default, :shunt, i)["bs"] = v
     end
 
     constraint_model_voltage(pm)

@@ -25,21 +25,18 @@ Random.seed!(1)
 
 # pull in a test case 
 case_name = "case14"
-dataset_name = "dcfeas_pert"
-file_pth = joinpath(DATA_PATH, "test_cases/data/$case_name/$dataset_name/0.json")
-test_case = PowerModels.parse_file(file_pth)
-test_case = prepare_test_case(test_case, case_name, file_pth)
+dataset_name = "extreme_pert"
+# one datapoint out of dataset.h5; the rest are never read
+dset_dir = joinpath(DATA_PATH, "test_cases/data/$case_name/$dataset_name/baseline_acpf")
+test_case = load_datapoint(dset_dir, first(dataset_datapoints(dset_dir)))
+test_case = prepare_test_case(test_case, case_name, dset_dir)
 
-#  compute ac opf setpoint dist
-# prepare_transformer_adjustments, apply_solution!, and solve_dc_ac_pf!
-# (the device=true pipeline: prepare -> solve_dc_ac_device_pf -> apply the
-# solution, snapping tap/shift to their nearest setpoint -> re-solve
-# solve_dc_ac_pf against those now-fixed values) now live in generate_dataset.jl
+#  compute ac opf setpoint dist (the device=true pipeline lives in generate_dataset.jl)
 ipopt = Ipopt.Optimizer
 solve_dc_ac_pf!(test_case, ipopt; device = true)
 
 
-# # compute acpf 
+#  compute acpf 
 # PowerModels.logger_config!("debug")
 # nearest_gens = find_nearest_generators_khop(file_pth)
 # test_case["pv_pairs"] = nearest_gens

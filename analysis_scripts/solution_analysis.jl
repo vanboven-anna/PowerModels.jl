@@ -1,37 +1,21 @@
-# Reads a directory of per-datapoint PowerModels case JSONs (as written by
-# run_scripts/generate_dataset.jl's generate_data!/store_datapoint!, each file
-# holding a perturbed case with the solved AC-PF setpoints baked into
-# "bus"/"gen") and reports:
-#   - the number of tap-changing and phase-shifting transformers in the
-#     network (a fixed topology property, counted once off the first
-#     datapoint - perturbations only change tap/shift values, not which
-#     branches are transformers)
-#   - for bus vm violations, generator qg violations, and branch
-#     voltage-angle-difference (va) violations:
-#       - the fraction of datapoints with at least one violation
-#       - the average, across datapoints, of the fraction of components violated
-#
-# PV/slack buses (bus_type != 1) are excluded from vm violation checks: their
-# vm is pinned to a generator's voltage setpoint (vg), so a high vm there
-# reflects that setpoint rather than an actual voltage violation.
-#
-# Run from the repo root:
-#   julia --project=. --startup-file=no analysis_scripts/solution_analysis.jl <dataset_path> [report_path]
+# vm/qg/va violation rates and transformer counts: julia --project=. analysis_scripts/solution_analysis.jl <dataset_path> [report_path]
 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
 
 using JSON
+using HDF5
 using Statistics
+# dataset_datapoints / load_datapoint
+isdefined(@__MODULE__, :load_datapoint) ||
+    include(joinpath(@__DIR__, "..", "run_scripts", "unpack_data.jl"))
 using Printf
 
 const EPSILON = 1e-5
 
 """
-Bus vm violations, restricted to PQ buses (bus_type == 1). PV/slack buses
-(bus_type 2/3) have vm pinned to a generator's vg setpoint -- a vm above
-vmax there reflects that setpoint, not a real voltage violation -- and
-bus_type 4 buses are out of service, so both are excluded.
+Bus vm violations, PQ buses (bus_type == 1) only: PV/slack vm is pinned to a
+generator's vg, and bus_type 4 is out of service.
 """
 function _vm_violations(case_data; epsilon = EPSILON)
     violated, total = 0, 0
@@ -86,16 +70,12 @@ function _va_violations(case_data; epsilon = EPSILON)
 end
 
 """
-Count the branches of `case_data` that Matpower encodes as transformers
-(`transformer == true`) that are tap-changing vs. phase-shifting, mirroring
-`run_scripts/generate_dataset.jl`'s `classify_transformers`: a branch is a
-tap-changer if `tap != 1.0`, and a phase-shifter if `shift` differs from "no
-shift" (0, or an equivalent full rotation of +-360 degrees / +-2*pi radians,
-since some case files encode "no shift" that way). A transformer can be both,
-so the two counts are not mutually exclusive.
+Transformer branches that are tap-changing (`tap != 1.0`) vs phase-shifting
+(`shift` not 0 or a full rotation), as `classify_transformers` splits them.
+Not mutually exclusive.
 """
 function _count_transformers(case_data; angle_eps = 1e-6)
-    full_rotation = 2 * pi  # shift is stored in radians; 360 degrees == 2*pi
+    full_rotation = 2 * pi  # shift is in radians
     tap_changing, phase_shifting = 0, 0
     for branch in values(case_data["branch"])
         get(branch, "transformer", false) || continue
@@ -121,11 +101,8 @@ function _datapoint_violations(case_data; epsilon = EPSILON)
 end
 
 """
-Aggregate a vector of (violated, total) pairs -- one per datapoint -- into
-the fraction of datapoints with any violation and the average, across
-datapoints, of the per-datapoint violated fraction. A datapoint with
-total == 0 (no eligible components) contributes a violated fraction of 0.0
-and counts as having no violation.
+(violated, total) pairs, one per datapoint, to the fraction of datapoints
+with any violation and the mean violated fraction. total == 0 counts as 0.0.
 """
 function _summarize(pairs)
     any_violation = [violated > 0 for (violated, total) in pairs]
@@ -138,37 +115,65 @@ function _summarize(pairs)
 end
 
 """
-Read every `<datapoint>.json` case file in `dataset_path` and summarize
-vm/qg/va violations across the dataset. Only files named as a bare integer
-(the `store_datapoint!` naming convention) are treated as case files, so a
-`violation_summary.json` report left over from a previous run in the same
-directory is not picked back up and parsed as a case.
+Directory to read datapoints from: a `dataset.h5`, the directory holding it,
+or a perturbation folder whose datapoints sit in `baseline_acpf/`.
+"""
+function _resolve_dataset_dir(dataset_path::AbstractString)
+    isfile(dataset_path) && endswith(dataset_path, ".h5") && return dirname(abspath(dataset_path))
+    if isempty(dataset_datapoints(dataset_path)) && isdir(joinpath(dataset_path, "baseline_acpf"))
+        return joinpath(dataset_path, "baseline_acpf")
+    end
+    return dataset_path
+end
+
+"""
+`f(case_data)` over `datapoints`, one case alive at a time. Opens the archive
+once rather than per datapoint as `load_datapoint` would.
+"""
+function _foreach_datapoint(f, dir, datapoints)
+    if has_dataset_h5(dir)
+        h5open(dataset_h5_path(dir), "r") do fid
+            stored = read(fid["datapoint"])
+            for dp in datapoints
+                row = findfirst(==(dp), stored)
+                row === nothing && error("analyze_dataset: datapoint $dp not in $(dataset_h5_path(dir))")
+                f(_build_sample(fid, row))
+            end
+        end
+    else
+        for dp in datapoints
+            f(load_datapoint(dir, dp))
+        end
+    end
+    return nothing
+end
+
+"""
+vm/qg/va violations summarized over every datapoint of a dataset.
+`dataset_path` goes through `_resolve_dataset_dir`.
 """
 function analyze_dataset(dataset_path::AbstractString; epsilon = EPSILON)
-    files = sort(filter(f -> occursin(r"^\d+\.json$", f), readdir(dataset_path)))
-    isempty(files) && error("No datapoint .json files found in $dataset_path")
+    dataset_dir = _resolve_dataset_dir(dataset_path)
+    datapoints = dataset_datapoints(dataset_dir)
+    isempty(datapoints) && error("No datapoints (dataset.h5 or <n>.json) found in $dataset_path (or its baseline_acpf/ subdirectory)")
 
     vm_pairs = Tuple{Int,Int}[]
     qg_pairs = Tuple{Int,Int}[]
     va_pairs = Tuple{Int,Int}[]
     num_tap_changing, num_phase_shifting = nothing, nothing
-    for file in files
-        case_data = JSON.parsefile(joinpath(dataset_path, file); dicttype = Dict{String,Any})
+    _foreach_datapoint(dataset_dir, datapoints) do case_data
         v = _datapoint_violations(case_data; epsilon = epsilon)
         push!(vm_pairs, v.vm)
         push!(qg_pairs, v.qg)
         push!(va_pairs, v.va)
         if num_tap_changing === nothing
-            # transformer topology is fixed by the network (perturbations only
-            # change tap/shift values, not which branches are transformers),
-            # so counting once off the first datapoint is enough
             num_tap_changing, num_phase_shifting = _count_transformers(case_data)
         end
     end
 
     return Dict(
-        "dataset_path" => abspath(dataset_path),
-        "num_files" => length(files),
+        "dataset_path" => abspath(dataset_dir),
+        "num_datapoints" => length(datapoints),
         "num_tap_changing_transformers" => num_tap_changing,
         "num_phase_shifting_transformers" => num_phase_shifting,
         "vm_violations" => _summarize(vm_pairs),
@@ -196,13 +201,14 @@ function _print_summary(summary)
 end
 
 function main()
-    CASE_NAME = "case2869_pegase"
-    PERT_NAME = "default_pert"
+    CASE_NAME = "case9241_pegase"
+    PERT_NAME = "extreme_pert"
     dataset_path = "../../bus_swap_data/test_cases/data/$CASE_NAME/$PERT_NAME"
-    report_path =  joinpath(dataset_path, "violation_summary.json")
 
     summary = analyze_dataset(dataset_path)
     _print_summary(summary)
+    # write the report next to the datapoints analyze_dataset found
+    report_path = joinpath(summary["dataset_path"], "violation_summary.json")
     _write_report(summary, report_path)
     println("Saved violation summary to $report_path")
     return summary

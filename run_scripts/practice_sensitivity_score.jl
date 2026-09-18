@@ -1,37 +1,4 @@
-#
-# Benchmark script: sensitivity_score donor selection vs nearest_gen / qv_inv,
-# plus the Sherman-Morrison warm-start speedup question.
-#
-# Methodology (apples-to-apples with the paper's Table I):
-#   - For each case, load the pre-generated perturbed-load xlsx dataset from
-#     `bus_swap_data/test_cases/data/<case>/loads/<delta>.xlsx` (these are the
-#     samples that the paper's `generate_dataset.jl::generate_loads` produces:
-#     each load is perturbed up to ~85% of max generation and filtered for
-#     DC-OPF + AC-OPF feasibility, with DC-OPF generator dispatch baked in).
-#   - Mirrors `prepare_test_case` from generate_dataset.jl: bumps each
-#     generator's bus vmax up to max(gen vg, bus vmax) and applies the
-#     `pg_line_limits.txt` overrides if present.
-#   - Runs every strategy on the SAME sample, so per-sample W/T/L comparisons
-#     are paired and noise-free.
-#
-# Auto-detection:
-#   - Looks for `bus_swap_data/` at the project root (the user's repo layout).
-#   - Falls back to `config.jl` -> DATA_PATH if that's how the user has set
-#     things up (matches generate_dataset.jl).
-#   - If neither is available, falls back to in-repo case14.m + random load
-#     scaling (informative for case14 only; case57/300 are skipped).
-#
-# What it reports per strategy:
-#   - feas%      feasibility rate (samples with no V or Q violations)
-#   - #V         avg # voltage-bound violations
-#   - |V|        avg total V violation magnitude  (paper's primary quality metric)
-#   - #Q         avg # reactive-power-bound violations
-#   - swp        avg bus-type-switching outer iters
-#   - jac        avg total Newton-Raphson iters across all swap iters
-#                (this is the metric the paper uses for the speed claim --
-#                 SMW is supposed to save ~1 NR iter per swap)
-#   - time(s)    avg wall-clock solve time
-#
+# benchmark: sensitivity_score vs nearest_gen / qv_inv on the same samples; reports feas%, #V, |V|, #Q, swp, jac, time(s)
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
 using PowerModels
@@ -55,8 +22,7 @@ if HAS_CONFIG
     include(joinpath(REPO_ROOT, "config.jl"))
 end
 
-# Resolve `case_name` -> .m file path. Prefer bus_swap_data, then config.jl,
-# then in-repo test data (case14 only).
+# case_name -> .m path: bus_swap_data, then config.jl, then in-repo case14
 function _case_path(case_name::String)
     if HAS_BSD
         p = joinpath(BSD_ROOT, "test_cases", "network_info", case_name, "$(case_name).m")
@@ -115,10 +81,7 @@ const CASES = ["case14", "case57", "case300", "case118", "case240", "case1354_pe
 
 # ----- strategies under comparison ------------------------------------------
 
-# (label, kind, kwargs). `kind` selects entry point:
-#   :baseline -> compute_ac_pf with enforce_q_lims=false
-#   :qlim     -> compute_ac_pf with enforce_q_lims=true
-#   :switch   -> compute_ac_pf_mult_buses with `swap_technique` etc.
+# (label, kind, kwargs); kind picks the entry point: :baseline / :qlim / :switch
 const STRATEGIES = [
     ("baseline",                   :baseline, NamedTuple()),
     ("qlim",                       :qlim,     NamedTuple()),
@@ -132,8 +95,7 @@ const STRATEGIES = [
 # ----- test-case prep (mirrors generate_dataset.jl::prepare_test_case) ------
 
 function _prepare_test_case!(test_case, case_name)
-    # Bump each generator's bus vmax up to max(gen vg, bus vmax) so that the
-    # voltage at gen buses isn't immediately at the upper bound.
+    # bump gen bus vmax to max(gen vg, bus vmax) so gen buses don't start at the bound
     for gen in values(test_case["gen"])
         gen_bus = gen["gen_bus"]
         bus = test_case["bus"][string(gen_bus)]
@@ -159,8 +121,7 @@ function _all_pairs_pv_pairs(data)
     return Dict{Int, Vector{Int}}(b => copy(gen_bus_ids) for b in load_bus_ids)
 end
 
-# Apply one row of the perturbed-load dataset to `data` in place. Mirrors
-# generate_dataset.jl::run_pf!: pd_<load>, qd_<load>, pg_<gen>.
+# apply one xlsx row (pd_<load>, qd_<load>, pg_<gen>) to `data` in place, as run_pf! does
 function _apply_xlsx_row!(data, row)
     for (load_ind, load) in pairs(data["load"])
         col = "pd_$load_ind"; load["pd"] = row[col]
@@ -179,8 +140,7 @@ function _scale_loads!(data, base_pd, base_qd, scale)
     end
 end
 
-# Count V/Q violations and total magnitudes in result["solution"]. Works for
-# both compute_ac_pf and compute_ac_pf_mult_buses.
+# V/Q violation counts and magnitudes from result["solution"]
 function _violations(data, result)
     nv_v = 0; nv_q = 0
     mag_v = 0.0; mag_q = 0.0
@@ -201,8 +161,7 @@ function _violations(data, result)
     return (nv_v, nv_q, mag_v, mag_q, true)
 end
 
-# Total NR iterations across all swap iters: count non-empty entries in
-# jacobian_history (it interleaves sparse Jacobians with `[]` separators).
+# total NR iters: non-empty entries of jacobian_history, which uses [] as a separator
 function _jac_iters(result)
     haskey(result, "jacobian_history") || return 0
     return count(j -> !(j isa AbstractVector && isempty(j)), result["jacobian_history"])
@@ -238,8 +197,7 @@ function _run_strategy(kind, kwargs, data)
     )
 end
 
-# Run every strategy once on the baseline data to pre-compile JIT. Without
-# this, timings on tiny cases are dominated by first-call compile overhead.
+# one warm-up run per strategy, or timings are all JIT compile overhead
 function _warmup_jit(base_data, pv_pairs)
     sample = deepcopy(base_data)
     sample["pv_pairs"] = deepcopy(pv_pairs)
@@ -265,8 +223,7 @@ function run_case(case_name::String; max_samples::Int = 50)
     base_qd = Dict{String, Float64}(k => l["qd"] for (k, l) in base_data["load"])
     pv_pairs = _all_pairs_pv_pairs(base_data)
 
-    # Try to load the pre-generated xlsx dataset (apples-to-apples); fall back
-    # to random scaling if no xlsx is available.
+    # prefer the pre-generated xlsx dataset; fall back to random scaling
     xlsx_path = _loads_xlsx_path(case_name)
     samples = NamedTuple[]
     src_label = ""

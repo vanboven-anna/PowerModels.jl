@@ -5,6 +5,8 @@ using Revise
 using PowerModels
 include("../config.jl")
 include("./find_nearest_gens.jl")
+# load_datapoint / dataset_datapoints, and the dataset.h5 layout H5Writer below writes
+include("./unpack_data.jl")
 push!(LOAD_PATH, DATA_PATH)
 using Infiltrator
 Infiltrator.toggle_async_check(false)
@@ -12,6 +14,7 @@ using DataFrames
 using OrderedCollections
 using DataStructures
 using JSON
+using HDF5
 using XLSX
 using Ipopt
 using Infiltrator
@@ -21,7 +24,326 @@ using LinearAlgebra
 using Distributions
 using Random
 using Graphs
-Random.seed!(2)
+# NOTE: the RNG is deliberately unseeded -- a seed would make resumed batches repeat samples
+
+# H5Writer / append_batch!: streaming writer for the dataset.h5 unpack_data.jl reads back
+
+const H5_CHUNK_ROWS = 64     # samples per chunk; matches the archives already written
+const H5_DEFLATE = 4
+const H5_COL_CHUNK = 256     # samples per chunk for the 1-D per-sample columns
+
+mutable struct H5Writer
+    path::String
+    case_name::String
+    source_dir::String
+    n::Int      # samples in the archive, including any an earlier run left there
+end
+
+"""
+    H5Writer(path; case_name = "", source_dir = "")
+
+Writer for the `dataset.h5` at `path`, appending to it if it exists so a
+stopped run resumes. `case_name` defaults to the first sample's `name`.
+"""
+function H5Writer(path::AbstractString; case_name = "", source_dir = "")
+    mkpath(dirname(path))
+    n = isfile(path) ? length(h5open(f -> read(f["datapoint"]), path, "r")) : 0
+    return H5Writer(String(path), String(case_name),
+                    isempty(source_dir) ? dirname(abspath(path)) : String(source_dir), n)
+end
+
+# a case key holding component dicts rather than a scalar; empty dcline/storage count
+_h5_is_component(v) = v isa AbstractDict && all(x -> x isa AbstractDict, values(v))
+
+function _h5_split_case(case)
+    comps, top = String[], Dict{String, Any}()
+    for (k, v) in case
+        k == "datapoint" && continue           # kept in its own root dataset
+        _h5_is_component(v) ? push!(comps, k) : (top[k] = v)
+    end
+    return sort(comps), top
+end
+
+# numeric order where the ids are numbers ("2" before "10"), as PowerModels ids are
+_h5_sorted_ids(ids) = sort(collect(ids);
+                           by = id -> (something(tryparse(Int, id), typemax(Int)), id))
+
+_h5_json(v) = JSON.json(v; allownan = true, inf = "null", ninf = "null", nan = "null")
+
+"""
+Storage kind for a field's values: `int`, `float`, `vec` (equal-length
+numeric vectors), or `json` for anything else.
+"""
+function _h5_kind(vals)
+    isempty(vals) && return "json"
+    all(v -> v isa Integer && !(v isa Bool), vals) && return "int"
+    all(v -> v isa Real && !(v isa Bool), vals) && return "float"
+    if all(v -> v isa AbstractVector && all(x -> x isa Real && !(x isa Bool), v), vals) &&
+       allequal(length(v) for v in vals)
+        return "vec"
+    end
+    return "json"
+end
+
+_h5_veclen(kind, vals) = kind == "vec" ? length(first(vals)) : 0
+
+function _h5_encode(kind, v)
+    if kind == "int"
+        v isa Integer && return Int64(v)
+        (v isa Real && isinteger(v)) && return Int64(v)
+        error("append_batch!: $v does not fit the Int64 column it belongs to")
+    elseif kind == "float"
+        return Float64(v)
+    elseif kind == "vec"
+        return Float64.(collect(v))
+    end
+    return _h5_json(v)
+end
+
+_h5_fill(kind) = kind == "int" ? Int64(0) : kind == "json" ? "null" : NaN
+
+# every sample's `field` values over `fids`, plus the mask of which samples had it
+function _h5_gather(cases, comp, field, fids)
+    m, nid = length(cases), length(fids)
+    vals = Vector{Any}(undef, m * nid)
+    pres = falses(m, nid)
+    for (i, case) in enumerate(cases)
+        cd = case[comp]
+        for (j, id) in enumerate(fids)
+            e = get(cd, id, nothing)
+            if e !== nothing && haskey(e, field)
+                vals[(j - 1) * m + i] = e[field]
+                pres[i, j] = true
+            end
+        end
+    end
+    return reshape(vals, m, nid), pres
+end
+
+_h5_present_vals(vals, pres) = [vals[i] for i in eachindex(pres) if pres[i]]
+
+function _h5_matrix(kind, vals, pres, veclen)
+    m, nid = size(vals)
+    if kind == "vec"
+        out = fill(NaN, m, nid, veclen)
+        for i in 1:m, j in 1:nid
+            pres[i, j] && (out[i, j, :] = _h5_encode(kind, vals[i, j]))
+        end
+        return out
+    end
+    T = kind == "int" ? Int64 : kind == "json" ? String : Float64
+    out = fill(_h5_fill(kind), m, nid)
+    out = convert(Matrix{T}, out)
+    for i in 1:m, j in 1:nid
+        pres[i, j] && (out[i, j] = _h5_encode(kind, vals[i, j]))
+    end
+    return out
+end
+
+function _h5_extend_write!(d, from::Int, data)
+    rows = (from + 1):(from + size(data, 1))
+    if ndims(data) == 3
+        HDF5.set_extent_dims(d, (last(rows), size(data, 2), size(data, 3)))
+        d[rows, :, :] = data
+    elseif ndims(data) == 2
+        HDF5.set_extent_dims(d, (last(rows), size(data, 2)))
+        d[rows, :] = data
+    else
+        HDF5.set_extent_dims(d, (last(rows),))
+        d[rows] = data
+    end
+    return d
+end
+
+function _h5_append_col!(fid, name, v, n0)
+    if !haskey(fid, name)
+        d = create_dataset(fid, name, datatype(eltype(v)),
+                           dataspace((0,); max_dims = (-1,));
+                           chunk = (H5_COL_CHUNK,), deflate = H5_DEFLATE)
+        # pad an archive whose earlier run didn't record this column
+        n0 > 0 && _h5_extend_write!(d, 0, fill(zero(eltype(v)), n0))
+    end
+    _h5_extend_write!(fid[name], n0, v)
+end
+
+function _h5_create_varying!(vg, field, kind, fids, veclen, n_backfill)
+    nid = length(fids)
+    T = kind == "int" ? Int64 : kind == "json" ? String : Float64
+    dims = kind == "vec" ? (0, nid, veclen) : (0, nid)
+    maxd = kind == "vec" ? (-1, nid, veclen) : (-1, nid)
+    chunk = kind == "vec" ? (H5_CHUNK_ROWS, nid, veclen) : (H5_CHUNK_ROWS, nid)
+    d = create_dataset(vg, field, datatype(T), dataspace(dims; max_dims = maxd);
+                       chunk = chunk, deflate = H5_DEFLATE)
+    attrs(d)["kind"] = kind
+    attrs(d)["ids"] = fids
+    attrs(d)["masked"] = 1
+    p = create_dataset(vg, "$(field)__present", datatype(UInt8),
+                       dataspace((0, nid); max_dims = (-1, nid));
+                       chunk = (H5_CHUNK_ROWS, nid), deflate = H5_DEFLATE)
+    # a field seen only partway through the run: earlier samples are masked absent
+    if n_backfill > 0
+        _h5_write_rows!(d, p, 0, falses(n_backfill, nid), kind, veclen,
+                        Matrix{Any}(undef, n_backfill, nid))
+    end
+    return d, p
+end
+
+function _h5_write_rows!(d, p, from, pres, kind, veclen, vals)
+    _h5_extend_write!(d, from, _h5_matrix(kind, vals, pres, veclen))
+    _h5_extend_write!(p, from, UInt8.(pres))
+end
+
+# a static field this batch disagreed with: move it to varying, backfilling its old value
+function _h5_promote!(vg, field, static_byid, fids, n0)
+    vals0 = [static_byid[id] for id in fids if haskey(static_byid, id)]
+    kind = _h5_kind(vals0)
+    veclen = _h5_veclen(kind, vals0)
+    d, p = _h5_create_varying!(vg, field, kind, fids, veclen, 0)
+    if n0 > 0
+        back = Matrix{Any}(undef, n0, length(fids))
+        pres = falses(n0, length(fids))
+        for (j, id) in enumerate(fids)
+            haskey(static_byid, id) || continue
+            for i in 1:n0
+                back[i, j] = static_byid[id]
+                pres[i, j] = true
+            end
+        end
+        _h5_write_rows!(d, p, 0, pres, kind, veclen, back)
+    end
+    return d, p
+end
+
+_h5_set_attr!(obj, k, v) = (haskey(attrs(obj), k) && delete_attribute(obj, k); attrs(obj)[k] = v)
+
+"""
+One component group for this batch. The first batch decides what is static;
+after that the schema on disk wins unless it can no longer describe a field.
+"""
+function _h5_append_component!(fid, comp, cases, n0)
+    m = length(cases)
+    ids = _h5_sorted_ids(union((keys(case[comp]) for case in cases)...))
+    fresh = !haskey(fid, comp)
+    if fresh
+        isempty(ids) && return          # empty in every sample: no group, reader gives Dict()
+        g = create_group(fid, comp)
+        attrs(g)["ids"] = ids
+        attrs(g)["static_json"] = "{}"
+        create_group(g, "varying")
+    end
+    g = fid[comp]
+    stored_ids = attrs(g)["ids"]
+    extra = setdiff(ids, stored_ids)
+    isempty(extra) ||
+        error("append_batch!: $comp gained id(s) $(sort(collect(extra))) part-way through " *
+              "$(HDF5.filename(fid)) -- the archive is built around a fixed set of components")
+    static = JSON.parse(attrs(g)["static_json"]; dicttype = Dict{String, Any})
+    vg = g["varying"]
+    existing = [f for f in keys(vg) if !endswith(f, "__present")]
+
+    batch_fields = Set{String}()
+    for case in cases, e in values(case[comp])
+        union!(batch_fields, keys(e))
+    end
+    # every varying dataset grows by `m` rows, or the sample axis stops lining up
+    static_changed = false
+
+    for field in sort(collect(union(batch_fields, Set(existing), Set(keys(static)))))
+        if haskey(static, field) && !(field in existing)
+            byid = static[field]
+            fids = _h5_sorted_ids(keys(byid))
+            vals, pres = _h5_gather(cases, comp, field, stored_ids)
+            holds = all(1:m) do i
+                all(enumerate(stored_ids)) do (j, id)
+                    pres[i, j] ? (haskey(byid, id) && isequal(vals[i, j], byid[id])) :
+                                 !haskey(byid, id)
+                end
+            end
+            holds && continue                       # still static, nothing to write
+            _h5_promote!(vg, field, byid, fids, n0)
+            delete!(static, field)
+            static_changed = true
+            push!(existing, field)
+        end
+
+        if field in existing
+            d = vg[field]
+            fids = attrs(d)["ids"]
+            kind = attrs(d)["kind"]
+            veclen = kind == "vec" ? size(d, 3) : 0
+            vals, pres = _h5_gather(cases, comp, field, fids)
+            _h5_write_rows!(d, vg["$(field)__present"], n0, pres, kind, veclen, vals)
+            continue
+        end
+
+        # first time this field is seen at all
+        fids = _h5_sorted_ids([id for id in stored_ids
+                               if any(haskey(get(case[comp], id, Dict()), field) for case in cases)])
+        vals, pres = _h5_gather(cases, comp, field, fids)
+        seen = _h5_present_vals(vals, pres)
+        kind = _h5_kind(seen)
+        veclen = _h5_veclen(kind, seen)
+        # on the first batch, a field identical in every sample goes to static_json
+        if fresh && all(pres) && all(i -> isequal(vals[i, :], vals[1, :]), 1:m)
+            static[field] = Dict{String, Any}(id => vals[1, j] for (j, id) in enumerate(fids))
+            static_changed = true
+            continue
+        end
+        d, p = _h5_create_varying!(vg, field, kind, fids, veclen, n0)
+        _h5_write_rows!(d, p, n0, pres, kind, veclen, vals)
+    end
+
+    static_changed && _h5_set_attr!(g, "static_json", _h5_json(static))
+    return nothing
+end
+
+function _h5_check_toplevel(fid, top)
+    stored = JSON.parse(attrs(fid)["toplevel_json"]; dicttype = Dict{String, Any})
+    bad = [k for k in union(keys(stored), keys(top)) if !isequal(get(stored, k, nothing), get(top, k, nothing))]
+    isempty(bad) ||
+        error("append_batch!: case-wide field(s) $(sort(bad)) differ from the ones " *
+              "$(HDF5.filename(fid)) was started with -- these are stored once for the " *
+              "whole archive, so samples with a different network belong in their own file")
+end
+
+"""
+    append_batch!(writer, cases, acpf_time, dcopf_time) -> Int
+
+Append case dicts (each carrying its `"datapoint"` index) and their solve
+times, returning the new total sample count.
+"""
+function append_batch!(w::H5Writer, cases::AbstractVector, acpf_time, dcopf_time)
+    isempty(cases) && return w.n
+    (length(acpf_time) == length(cases) && length(dcopf_time) == length(cases)) ||
+        error("append_batch!: got $(length(cases)) cases but $(length(acpf_time)) acpf / " *
+              "$(length(dcopf_time)) dcopf times")
+    comps, top = _h5_split_case(cases[1])
+
+    h5open(w.path, isfile(w.path) ? "r+" : "w") do fid
+        n0 = haskey(fid, "datapoint") ? length(fid["datapoint"]) : 0
+        if !haskey(attrs(fid), "toplevel_json")
+            attrs(fid)["format_version"] = 1
+            attrs(fid)["streaming"] = 1
+            attrs(fid)["case_name"] = isempty(w.case_name) ?
+                                      string(get(cases[1], "name", "")) : w.case_name
+            attrs(fid)["source_dir"] = w.source_dir
+            attrs(fid)["components"] = comps
+            attrs(fid)["toplevel_json"] = _h5_json(top)
+        end
+        _h5_check_toplevel(fid, top)
+        known = attrs(fid)["components"]
+        union(known, comps) == known || _h5_set_attr!(fid, "components", sort(union(known, comps)))
+
+        _h5_append_col!(fid, "datapoint", Int64[Int(c["datapoint"]) for c in cases], n0)
+        _h5_append_col!(fid, "acpf_time", Float64.(collect(acpf_time)), n0)
+        _h5_append_col!(fid, "dcopf_time", Float64.(collect(dcopf_time)), n0)
+        for comp in comps
+            _h5_append_component!(fid, comp, cases, n0)
+        end
+        w.n = n0 + length(cases)
+    end
+    return w.n
+end
 
 function _determine_acpf_feasibility(test_case, viol_dict; epsilon=1e-5)
     total_violations, total_vm_violations, total_q_violations, total_branch_violations = 0, 0, 0, 0
@@ -90,25 +412,10 @@ the range to a single point). Return that point directly instead of drawing.
 _rand_uniform(a, b) = a == b ? a : rand(Uniform(a, b))
 
 """
-Draw a perturbed load (and, if `qd_loads` is given, reactive load) that
-satisfies `_verify_loads_`, retrying up to `max_attempts` times. Iterative
-rather than recursive on purpose: a recursive "retry on failure" (as this
-used to be) has no bound on stack depth, and for a case/config combination
-where no draw is ever feasible (e.g. `max_pd` too tight at some bus for the
-configured `delta`/`jitter_delta` range) it eventually crashes with a
-`StackOverflowError` instead of failing with a clear, diagnosable error --
-or, worse, appears to just hang indefinitely accumulating stack frames.
-
-Both `delta` (the global scaling range) and `jitter_delta` (the per-load
-range) shrink on every retry -- linearly, from the full amount on attempt 1
-down to `1/max_attempts` of it on the last attempt -- so a case that's only
-occasionally pushed infeasible by an aggressive draw becomes more likely to
-succeed the more it retries, rather than re-rolling the same range forever.
-This can't rescue a case/bus that's already infeasible at zero perturbation
-(shrinking `delta` toward 0 makes `global_scale` approach 1, i.e. the
-nominal, unperturbed load -- it never pushes below what a smaller `delta`
-already allows), so that failure mode still surfaces as the `error` below,
-just after `max_attempts` tries instead of 1000.
+Draw a perturbed load satisfying `_verify_loads_`, up to `max_attempts`
+times, shrinking `delta`/`jitter_delta` on each retry. Iterative, not
+recursive: an always-infeasible case must error, not overflow the stack.
+A case infeasible at zero perturbation still fails here.
 """
 function perturb_load!(test_case, loads, delta, max_pd; qd_loads = nothing, jitter_delta = 0.05, max_attempts = 20)
     # get max and min total generation
@@ -118,8 +425,7 @@ function perturb_load!(test_case, loads, delta, max_pd; qd_loads = nothing, jitt
     min_qg = qd_loads === nothing ? nothing : sum([gen["qmin"] for gen in values(test_case["gen"])])
 
     for attempt in 1:max_attempts
-        # shrink the perturbation range on every retry, from the full amount
-        # (attempt 1) down to 1/max_attempts of it (the last attempt)
+        # shrink the perturbation range each retry, down to 1/max_attempts on the last
         shrink = 1 - (attempt - 1) / max_attempts
         attempt_delta = delta * shrink
         attempt_jitter_delta = jitter_delta * shrink
@@ -151,25 +457,7 @@ function perturb_load!(test_case, loads, delta, max_pd; qd_loads = nothing, jitt
     error("perturb_load!: no feasible load draw found in $max_attempts attempts (starting delta=$delta, jitter_delta=$jitter_delta, shrinking toward the nominal load each retry) -- max_pd or generation bounds may be too tight for this case/config even near zero perturbation")
 end
 
-# -----------------------------------------------------------------------------
-# Perturbation config
-#
-# Every percentage/fraction used by the perturbation functions below lives in
-# `perturbation_configs/default_pert.json` (next to this file, path stored in
-# PERTURBATION_CONFIGS_DIR/DEFAULT_PERTURBATION_CONFIG_PATH). Call
-# `load_perturbation_config()` to get the defaults, optionally passing the
-# full path to a second JSON file whose values override the defaults (only
-# the keys you supply are overridden - anything you omit falls back to the
-# default). The resulting nested Dict can be splatted into the perturbation
-# functions, e.g.:
-#
-#   cfg = load_perturbation_config(joinpath(PERTURBATION_CONFIGS_DIR, "my_overrides.json"))
-#   shuffle_gencost!(test_case; shuffle_fraction = cfg["gencost"]["shuffle_fraction"])
-#
-# `generate_data`'s `pert_config_path` kwarg takes just a filename (or an
-# absolute path) and resolves it against PERTURBATION_CONFIGS_DIR itself, so
-# it works no matter what the shell's current working directory is.
-# -----------------------------------------------------------------------------
+# perturbation config: fractions come from perturbation_configs/, overridable per key
 
 const PERTURBATION_CONFIGS_DIR = joinpath(@__DIR__, "perturbation_configs")
 const DEFAULT_PERTURBATION_CONFIG_PATH = joinpath(PERTURBATION_CONFIGS_DIR, "default_pert.json")
@@ -195,12 +483,7 @@ function _merge_perturbation_config!(base::Dict, overrides::Dict)
     return base
 end
 
-# -----------------------------------------------------------------------------
-# Perturbation functions
-#
-# Each function mutates `test_case` in place (hence the "!") and also returns
-# it, so calls can be chained, e.g. `test_case |> shuffle_gencost! |> perturb_gen!`.
-# -----------------------------------------------------------------------------
+# perturbation functions: each mutates `test_case` in place and returns it, so they chain
 
 """
 Shuffle the generator cost coefficient vectors ("cost") among a random subset
@@ -223,10 +506,8 @@ function shuffle_gencost!(test_case; shuffle_fraction = 0.20)
 end
 
 """
-Squeeze the [pmin, pmax] range for a random subset of generators.
-`gen_fraction` (0-1) controls how many generators are affected; for each
-selected generator a squeeze percentage is drawn uniformly from
-[0, max_squeeze_pct] and applied symmetrically to pmin/pmax.
+Squeeze [pmin, pmax] on a `gen_fraction` subset of generators, each by a
+percentage drawn from [0, max_squeeze_pct] and applied symmetrically.
 """
 function perturb_gen!(test_case; gen_fraction = 0.50, max_squeeze_pct = 0.20)
     gen_ids = collect(keys(test_case["gen"]))
@@ -243,10 +524,8 @@ function perturb_gen!(test_case; gen_fraction = 0.50, max_squeeze_pct = 0.20)
 end
 
 """
-Squeeze the [vmin, vmax] range for a random subset of buses.
-`bus_fraction` (0-1) controls how many buses are affected; for each selected
-bus a squeeze percentage is drawn uniformly from [0, max_squeeze_pct] and
-applied symmetrically to vmin/vmax.
+Squeeze [vmin, vmax] on a `bus_fraction` subset of buses, each by a
+percentage drawn from [0, max_squeeze_pct] and applied symmetrically.
 """
 function vsqueeze!(test_case; bus_fraction = 0.30, max_squeeze_pct = 0.20)
     bus_ids = collect(keys(test_case["bus"]))
@@ -263,10 +542,8 @@ function vsqueeze!(test_case; bus_fraction = 0.30, max_squeeze_pct = 0.20)
 end
 
 """
-Squeeze the [angmin, angmax] voltage angle difference range for a random
-subset of lines. `line_fraction` (0-1) controls how many branches are
-affected; for each selected branch a squeeze percentage is drawn uniformly
-from [0, max_squeeze_pct] and applied symmetrically to angmin/angmax.
+Squeeze [angmin, angmax] on a `line_fraction` subset of branches, each by a
+percentage drawn from [0, max_squeeze_pct] and applied symmetrically.
 """
 function vasqueeze!(test_case; line_fraction = 0.30, max_squeeze_pct = 0.10)
     branch_ids = collect(keys(test_case["branch"]))
@@ -283,10 +560,8 @@ function vasqueeze!(test_case; line_fraction = 0.30, max_squeeze_pct = 0.10)
 end
 
 """
-Squeeze the thermal rating ("rate_a") of a random subset of lines.
-`line_fraction` (0-1) controls how many branches are affected; for each
-selected branch a squeeze percentage is drawn uniformly from
-[0, max_squeeze_pct] and rate_a is scaled down by (1 - squeeze_pct).
+Squeeze `rate_a` on a `line_fraction` subset of branches, each scaled by
+(1 - squeeze_pct) for a percentage drawn from [0, max_squeeze_pct].
 """
 function thermal_squeeze!(test_case; line_fraction = 0.20, max_squeeze_pct = 0.20)
     branch_ids = collect(keys(test_case["branch"]))
@@ -318,30 +593,16 @@ function perturb_sus!(test_case; bs_delta = 0.10, shunt_fraction = 0.20)
 end
 
 """
-Generator and line outages (`pert_genstatus!`/`pert_linestatus!`) are only
-applied to networks larger than this many buses. Small test cases (e.g.
-case9/case14) are prone to having every line be a bridge and every generator
-be load-critical, so a single outage often leaves the network unable to
-serve its load at all; larger networks have enough redundancy for outages to
-be a meaningful, usually-still-solvable perturbation.
+Outages are skipped on networks this size or smaller: a small case has too
+little redundancy for a single outage to leave a solvable network.
 """
 const OUTAGE_MIN_BUSES = 300
 
 """
-Turn OFF (`gen_status = 0`) `num_gens` randomly-selected, currently in-service
-generators (an outright count, not a fraction). The slack-bus generator is
-never turned off, since a network with no reference bus can't be solved.
-Meant to be called before DC-OPF, so both the DC- and AC-feasibility checks
-run against the reduced generator fleet. No-op on networks with
-`OUTAGE_MIN_BUSES` buses or fewer.
-
-Runs `PowerModels.correct_bus_types!` afterward: a PV bus whose only
-generator just got turned off would otherwise be left with `bus_type == 2`
-but zero active generators, which the AC-PF solver doesn't handle gracefully
-(it assumes every PV bus has an active generator, and crashes with a
-`KeyError` rather than failing gracefully otherwise); `correct_bus_types!`
-demotes it to a PQ bus (`bus_type = 1`), same as PowerModels does for any
-other topology change.
+Turn off `num_gens` in-service generators (a count, not a fraction), never
+the slack. Call before DC-OPF. No-op at `OUTAGE_MIN_BUSES` buses or fewer.
+`correct_bus_types!` afterwards demotes any PV bus left with no generator,
+which the AC-PF solver would otherwise hit a `KeyError` on.
 """
 function pert_genstatus!(test_case; num_gens::Integer = 0)
     num_gens <= 0 && return test_case
@@ -361,25 +622,10 @@ function pert_genstatus!(test_case; num_gens::Integer = 0)
 end
 
 """
-Turn OFF (`br_status = 0`) `num_lines` randomly-selected, currently in-service
-branches (an outright count, not a fraction). Meant to be called after
-DC-OPF but before the AC-PF solve, modeling a line outage that happens after
-dispatch (e.g. an N-1 contingency) rather than one DC-OPF dispatched around.
-
-Candidates are drawn in random order and accepted one at a time: a candidate
-is only turned off if doing so leaves its two endpoint buses still connected
-to each other by some other path (checked directly against the graph as it
-stands *after* every previously-accepted removal, via `Graphs.has_path`) --
-if not, that candidate is skipped (left in service) and the next random
-candidate is tried instead, until `num_lines` have been turned off or no
-candidates remain. This guarantees no bus ever ends up islanded, even when
-`num_lines > 1` and no single one of the removed lines would have been
-unsafe on its own but the *combination* would island a bus. An islanded bus
-isn't a case the downstream AC-PF solver handles gracefully -- it crashes
-with a low-level error (summing over an empty neighbor set) rather than
-reporting infeasibility the way the rest of this pipeline expects.
-
-No-op on networks with `OUTAGE_MIN_BUSES` buses or fewer.
+Turn off `num_lines` in-service branches (a count, not a fraction), modeling
+an outage after dispatch. Candidates are accepted one at a time and only if
+the endpoints stay connected, so no combination of removals islands a bus
+(the AC-PF solver crashes on one). No-op at `OUTAGE_MIN_BUSES` or fewer.
 """
 function pert_linestatus!(test_case; num_lines::Integer = 0)
     num_lines <= 0 && return test_case
@@ -387,10 +633,7 @@ function pert_linestatus!(test_case; num_lines::Integer = 0)
     in_service = [(ind, branch) for (ind, branch) in test_case["branch"] if get(branch, "br_status", 1) != 0]
     isempty(in_service) && return test_case
 
-    # `Graphs.SimpleGraph` has no concept of parallel edges, so two branches
-    # on the same bus pair collapse into a single graph edge; `pair_remaining`
-    # tracks the true (still in-service) count per pair so a redundant
-    # parallel branch can be removed freely without ever touching the graph
+    # SimpleGraph collapses parallel branches, so pair_remaining tracks the real count
     bus_ids = sort(unique(vcat([b["f_bus"] for (_, b) in in_service], [b["t_bus"] for (_, b) in in_service])))
     bus_to_vertex = Dict(bus => v for (v, bus) in enumerate(bus_ids))
     g = Graphs.SimpleGraph(length(bus_ids))
@@ -431,24 +674,15 @@ function pert_linestatus!(test_case; num_lines::Integer = 0)
     return test_case
 end
 
-# Real OLTC/phase-shifter tap changers move in fixed discrete steps rather
-# than a continuous range, so perturbations are drawn from a discrete grid
-# of step multiples (..., -2, -1, 0, 1, 2, ...) instead of `rand(Uniform(...))`.
+# real tap changers move in discrete steps, so draw from a step grid, not a Uniform
 const TAP_STEP_PCT = 0.006   # 0.6% per discrete tap-changer step
 const SHIFT_STEP_DEG = 2.0   # degrees per discrete phase-shifter step
 const SHIFT_STEP_RAD = deg2rad(SHIFT_STEP_DEG)
 
 """
-Classify the branches of `test_case` that Matpower encodes as transformers
-(`transformer == true`) into tap-changing and phase-shifting sets. Matpower
-only distinguishes a transformer from an ordinary line via `tap != 1.0` (an
-off-nominal turns ratio) or `shift` differing from "no shift" - and some case
-files encode "no shift" as a full rotation (±360 degrees, i.e. ±2π radians)
-rather than exactly 0, so that's checked too. A transformer can be both a
-tap-changer and a phase-shifter at once, so the two returned ID vectors may
-overlap. Call this once on the base case, before the generation loop, so
-every sample perturbs the same fixed sets of eligible branches rather than
-re-deriving (and potentially drifting) them on each perturbed copy.
+Transformer branch IDs split into tap-changing (`tap != 1.0`) and
+phase-shifting (`shift` not 0 or a full rotation); the two may overlap.
+Call once on the base case so every sample perturbs the same sets.
 """
 function classify_transformers(test_case; angle_eps = 1e-6)
     full_rotation = 2 * pi  # shift is stored in radians; 360 degrees == 2*pi
@@ -470,13 +704,9 @@ function classify_transformers(test_case; angle_eps = 1e-6)
 end
 
 """
-Perturb the tap ratio of a random subset of `eligible_ids` (the tap-changing
-transformer branch IDs returned by `classify_transformers`) by a random
-integer multiple (in `-max_steps:max_steps`) of `step_pct` (multiplicative),
-mimicking a discrete mechanical tap changer (default step: 0.6%, i.e. a ±10%
-range over 33 physical positions). `tap_fraction` (0-1) controls what
-fraction of `eligible_ids` are perturbed; `max_steps` controls how many steps
-(in either direction) a selected transformer may move.
+Scale the tap of a `tap_fraction` subset of `eligible_ids` by an integer
+multiple in `-max_steps:max_steps` of `step_pct`, as a mechanical tap changer
+moves (default 0.6%, a ±10% range over 33 positions).
 """
 function perturb_tap!(test_case, eligible_ids; max_steps::Integer = 10, tap_fraction = 0.20, step_pct = TAP_STEP_PCT)
     num_to_perturb = round(Int, tap_fraction * length(eligible_ids))
@@ -490,15 +720,9 @@ function perturb_tap!(test_case, eligible_ids; max_steps::Integer = 10, tap_frac
 end
 
 """
-Perturb the phase shift of a random subset of `eligible_ids` (the
-phase-shifting transformer branch IDs returned by `classify_transformers`) by
-a random integer multiple (in `-max_steps:max_steps`) of `step_rad` (additive
-- phase shift is an angle, not a ratio), mimicking a discrete mechanical tap
-changer (default step: 2 degrees). `test_case["branch"][...]["shift"]` is
-stored in radians by PowerModels, so `step_rad` defaults to
-`SHIFT_STEP_RAD = deg2rad(SHIFT_STEP_DEG)`. `shift_fraction` (0-1) controls
-what fraction of `eligible_ids` are perturbed; `max_steps` controls how many
-steps (in either direction) a selected transformer may move.
+Shift the phase of a `shift_fraction` subset of `eligible_ids` by an integer
+multiple in `-max_steps:max_steps` of `step_rad` (additive, default 2
+degrees). `shift` is stored in radians.
 """
 function perturb_shift!(test_case, eligible_ids; max_steps::Integer = 10, shift_fraction = 0.20, step_rad = SHIFT_STEP_RAD)
     num_to_perturb = round(Int, shift_fraction * length(eligible_ids))
@@ -512,20 +736,10 @@ function perturb_shift!(test_case, eligible_ids; max_steps::Integer = 10, shift_
 end
 
 """
-Add tap/shift tuning bounds and discrete setpoint grids to the branches in
-`tap_ids`/`shift_ids` (the tap-changing/phase-shifting branch IDs from
-`classify_transformers`), and shunt susceptance bounds to every shunt, for
-use by `PowerModels.build_dc_ac_device_pf`. Every flagged branch shares the
-same physical tap-changer/phase-shifter setpoint grid, centered on nominal
-(tap = 1, shift = 0) rather than that branch's own tap/shift -- e.g.
-`tap_setpoints = [0.90, 0.9075, 0.915, ..., 1.095]`,
-`shift_setpoints = [-0.3, -0.25, ..., 0.3]` -- since real tap-changer
-positions are fixed steps around nominal, the same for every transformer of
-a given design, regardless of where a particular one currently sits. Shunt
-`bmin`/`bmax` stay relative to each shunt's own `bs` (susceptance has no
-equivalent fixed physical grid here); `minmax(...)` guards against the
-bounds coming out reversed when `bs` is negative. Mutates and returns
-`test_case`.
+Tuning bounds and discrete setpoint grids on `tap_ids`/`shift_ids`, plus
+shunt susceptance bounds, for `build_dc_ac_device_pf`. Every flagged branch
+shares one grid centered on nominal, as real tap positions are. Shunt
+bmin/bmax stay relative to each `bs`.
 """
 function prepare_transformer_adjustments(test_case, tap_ids, shift_ids)
     tap_range = 0.1
@@ -561,22 +775,9 @@ end
 """
     apply_solution!(test_case, result)
 
-Writes a `PowerModels` OPF/PF `result`'s solution back into `test_case`: bus
-`vm`/`va`, gen `pg`/`qg` (with `vg` updated to the solved `vm` at that
-generator's bus -- the AC-feasible point a setpoint-distance objective like
-`build_dc_ac_pf`/`build_dc_ac_device_pf` converged to), and, for any branch
-carrying a solved `tap`/`shift` (i.e. one `build_dc_ac_device_pf` treated as
-tunable, per `prepare_transformer_adjustments`), that branch's `tap`/`shift`
-snapped to the nearest entry in its `tap_setpoints`/`shift_setpoints` grid.
-Reusable across any solve whose solution has this "bus"/"gen"/"branch" shape
--- the tap/shift snap is simply skipped for a branch/result that doesn't
-carry it. Iterates over `solution`'s components, not `test_case`'s: PowerModels
-only includes *active* buses/gens/branches in a solution (an out-of-service
-generator, e.g. one `pert_genstatus!` turned off, or an islanded bus, never
-gets a variable and so is simply absent from `solution`, even though it's
-still listed in `test_case`) -- so a component missing from `solution` is
-left as-is in `test_case` rather than raising a `KeyError`. Mutates and
-returns `test_case`.
+Write a solution back into `test_case`: bus vm/va, gen pg/qg (vg to the solved
+vm at its bus), solved tap/shift snapped to its grid. Iterates the solution,
+not `test_case`, since inactive components are absent from it.
 """
 function apply_solution!(test_case, result)
     solution = result["solution"]
@@ -610,25 +811,9 @@ end
 """
     solve_dc_ac_pf!(test_case, optimizer; device::Bool = false)
 
-Solves for the AC-feasible operating point closest to the generator voltage
-setpoints in `test_case` (`PowerModels.solve_dc_ac_pf`), writing the solution
-back into `test_case` via `apply_solution!`.
-
-If `device = true`, first solves the same problem but also letting
-transformer tap/shift (and shunt susceptance) move continuously
-(`PowerModels.solve_dc_ac_device_pf`, after flagging the tunable branches via
-`classify_transformers` + `prepare_transformer_adjustments`), and applies
-that solution -- which snaps the solved tap/shift to the nearest entry in
-their discrete setpoint grid. Only then is the plain (non-device) problem
-solved and applied: `build_dc_ac_device_pf` optimizes tap/shift as
-continuous and knows nothing about the discrete grid, so this final resolve
--- now against the branches' snapped, fixed tap/shift -- is what actually
-finds the best AC-feasible point given those discretized values.
-
-Returns `(test_case, result)` -- `result` is the *final* (non-device) solve's
-full `PowerModels` result dict (`"termination_status"`, `"objective"`,
-`"solve_time"`, ...), since that's the solve whose solution ends up in
-`test_case`.
+AC-feasible point closest to the generator voltage setpoints, applied back into
+`test_case`. `device = true` first solves with tap/shift/shunt free, snaps them
+to their grid, then resolves. Returns `(test_case, result)` for the last solve.
 """
 function solve_dc_ac_pf!(test_case, optimizer; device::Bool = false)
     if device
@@ -636,12 +821,7 @@ function solve_dc_ac_pf!(test_case, optimizer; device::Bool = false)
         prepare_transformer_adjustments(test_case, tap_ids, shift_ids)
         device_result = PowerModels.solve_dc_ac_device_pf(test_case, optimizer)
         apply_solution!(test_case, device_result)
-        # `build_dc_ac_device_pf`, like `build_dc_ac_pf`, stashes its
-        # soft-bound relaxation info in `pm.data["soft_bound_penalty_dict"]`
-        # -- and `pm.data` *is* `test_case` (PowerModels doesn't copy it), so
-        # this leaks a `Dict{MOI.ConstraintIndex, ...}` into test_case that
-        # isn't JSON-serializable. Drop it now so it doesn't carry into the
-        # next solve's data or into a caller that persists test_case.
+        # the build leaks a non-serializable penalty dict into test_case (pm.data is it)
         delete!(test_case, "soft_bound_penalty_dict")
     end
     result = PowerModels.solve_dc_ac_pf(test_case, optimizer)
@@ -651,48 +831,15 @@ function solve_dc_ac_pf!(test_case, optimizer; device::Bool = false)
 end
 
 """
-    generate_optimal_dataset(dataset_path; device::Bool = false, log_level::String = "warn")
+    generate_optimal_dataset(dataset_path; device = false, smoke = false)
 
-For every `<n>.json` case file directly inside `dataset_path/baseline_acpf`
-(the raw, unsolved cases -- see `move_to_baseline_acpf`; same
-`^\\d+\\.json\$` naming convention `store_datapoint!`/`generate_data` write),
-parses it, solves it with `solve_dc_ac_pf!(...; device = device)`, and writes
-the resulting test case to `<dataset_path>/dc_ac_device_pf/<n>.json` when
-`device = true`, or `<dataset_path>/dc_ac_pf/<n>.json` otherwise -- a sibling
-of `baseline_acpf`, not nested inside it -- always under the exact same
-`<n>.json` filename the input case file had, so e.g. `1.json` in
-`baseline_acpf/`, `dc_ac_pf/`, and `dc_ac_device_pf/` are all the same
-underlying case, and a later comparison across those directories can just
-pull matching filenames.
-
-A case whose final solve doesn't reach `LOCALLY_SOLVED` is skipped (not
-written) rather than persisting an unconverged operating point -- which means
-that case's filename simply won't exist in `out_dir`, even though it does in
-`baseline_acpf` (and possibly in the *other* device-flag's output directory,
-if that one converged). Skipped filenames are printed (not just a count) so
-that's visible before it surprises a later cross-directory pull.
-
-Also writes `metadata.xlsx` into `out_dir`, one row per *attempted* case file
-(including skipped ones -- `datapoint` is the only column guaranteed to line
-up with what actually landed in `out_dir`) with:
-  - `datapoint`: the case's numeric filename, e.g. `7` for `7.json`
-  - `feasible`: `true` only if the final solve reached `LOCALLY_SOLVED` *and*
-    the resulting point has zero real AC-PF violations per
-    `_determine_acpf_feasibility` -- `solve_dc_ac_pf`/`solve_dc_ac_device_pf`
-    keep qg/vm bounds *soft* (penalized, not enforced), so `LOCALLY_SOLVED`
-    alone doesn't mean those bounds actually held
-  - `time`: wall-clock seconds spent inside `solve_dc_ac_pf!` for that case
-    -- for `device = true` this covers *both* optimization calls (the device
-    solve and the final resolve), not just the last one
-  - `objective`: the final (non-device) solve's objective value
-
-Returns the output directory path.
+`solve_dc_ac_pf!` over `<dataset_path>/baseline_acpf`, into the sibling
+`dc_ac_device_pf/` or `dc_ac_pf/` under the same index; unconverged datapoints
+are skipped and printed. Also writes `metadata.xlsx`, one row per attempt.
 """
-function generate_optimal_dataset(dataset_path; device::Bool = false, log_level::String = "error")
+function generate_optimal_dataset(dataset_path; device::Bool = false, smoke::Bool = false, smoke_n::Integer = 10, log_level::String = "error", batch_size::Int = 100)
     PowerModels.logger_config!(log_level)
-    # see the matching comment in generate_data: Ipopt's console output is a
-    # separate channel from PowerModels' logger, controlled by its own
-    # "print_level" option, not by `PowerModels.logger_config!`
+    # Ipopt's console output is its own channel, not PowerModels' logger
     ipopt_print_level = log_level == "error" ? 0 : 1
     ipopt = optimizer_with_attributes(Ipopt.Optimizer, "print_level" => ipopt_print_level)
 
@@ -700,39 +847,52 @@ function generate_optimal_dataset(dataset_path; device::Bool = false, log_level:
     out_dir = joinpath(dataset_path, device ? "dc_ac_device_pf" : "dc_ac_pf")
     mkpath(out_dir)
 
-    case_files = filter(f -> occursin(r"^\d+\.json$", f), readdir(in_dir))
+    datapoints = dataset_datapoints(in_dir)
+    isempty(datapoints) && error("generate_optimal_dataset: no datapoints (dataset.h5 or <n>.json) in $in_dir")
+
+    # smoke-test mode: only the first `smoke_n` datapoints
+    if smoke
+        datapoints = datapoints[1:min(smoke_n, end)]
+        println("generate_optimal_dataset: SMOKE mode -- first $(length(datapoints)) datapoint(s) only: $datapoints")
+    end
 
     metadata = DataFrame(datapoint = Int[], feasible = Bool[], time = Float64[], objective = Float64[])
 
-    written, skipped = 0, String[]
-    for (processed, f) in enumerate(case_files)
-        datapoint = parse(Int, splitext(f)[1])
-        test_case = PowerModels.parse_file(joinpath(in_dir, f))
-        # write the solved case out under the same filename `f` it came in
-        # under (see docstring) -- never renumbered/reindexed
+    # solved cases accumulate into one dataset.h5, flushed every `batch_size`
+    writer = H5Writer(joinpath(out_dir, "dataset.h5"))
+    batch, batch_time, batch_dc = Any[], Float64[], Float64[]
+    flush_batch! = () -> begin
+        isempty(batch) && return
+        append_batch!(writer, batch, batch_time, batch_dc)
+        empty!(batch); empty!(batch_time); empty!(batch_dc); GC.gc()
+    end
+
+    written, skipped = 0, Int[]
+    for (processed, datapoint) in enumerate(datapoints)
+        test_case = load_datapoint(in_dir, datapoint)
         local result
         elapsed = @elapsed (test_case, result) = solve_dc_ac_pf!(test_case, ipopt; device = device)
         solved = result["termination_status"] == LOCALLY_SOLVED
-        # `_determine_acpf_feasibility` checks the real (hard) AC-PF limits
-        # against test_case's now-solved vm/va/pg/qg -- separate from
-        # `solved`, since qg/vm bounds are only ever *soft* in these builds
+        # qg/vm bounds are soft in these builds, so check the hard limits separately
         feasible = solved && _determine_acpf_feasibility(test_case, Dict())["total_violations"] == 0
         push!(metadata, (datapoint, feasible, elapsed, result["objective"]))
 
         if !solved
-            push!(skipped, f)
+            push!(skipped, datapoint)
         else
-            # pretty-print (4-space indent) so the file is easy to read by eye; keeps
-            # the same Inf/NaN -> "null" handling PowerModels.export_file uses so the
-            # file still round-trips through PowerModels.parse_file
-            JSON.json(joinpath(out_dir, f), test_case; pretty = 4, allownan = true, inf = "null", ninf = "null", nan = "null")
+            # original index, never renumbered, so it lines up with baseline_acpf
+            test_case["datapoint"] = datapoint
+            push!(batch, test_case); push!(batch_time, elapsed); push!(batch_dc, 0.0)
+            length(batch) >= batch_size && flush_batch!()
             written += 1
         end
 
         if processed % 50 == 0
-            println("generate_optimal_dataset: processed $processed/$(length(case_files)) (written $written, skipped $(length(skipped))) -- $out_dir")
+            println("generate_optimal_dataset: processed $processed/$(length(datapoints)) (written $written, skipped $(length(skipped))) -- $out_dir")
+            flush(stdout)
         end
     end
+    flush_batch!()
 
     metadata_path = joinpath(out_dir, "metadata.xlsx")
     isfile(metadata_path) && rm(metadata_path)
@@ -741,9 +901,153 @@ function generate_optimal_dataset(dataset_path; device::Bool = false, log_level:
         XLSX.writetable!(sheet, Tables.columntable(metadata))
     end
 
-    println("generate_optimal_dataset: wrote $written cases to $out_dir")
+    println("generate_optimal_dataset: wrote $written cases to $(joinpath(out_dir, "dataset.h5"))")
     if !isempty(skipped)
-        println("generate_optimal_dataset: skipped $(length(skipped)) unconverged case(s), missing from $out_dir: $(sort(skipped))")
+        println("generate_optimal_dataset: skipped $(length(skipped)) unconverged datapoint(s), missing from $out_dir: $(sort(skipped))")
+    end
+    return out_dir
+end
+
+"""
+    common_datapoint_files(dir; exclude = String[])
+
+Sorted datapoint indices present in every immediate subdirectory of `dir`,
+i.e. those a cross-directory comparison has a match for in each.
+"""
+function common_datapoint_files(dir; exclude = String[])
+    subdirs = filter(d -> isdir(joinpath(dir, d)) && !(d in exclude), readdir(dir))
+    isempty(subdirs) && return Int[], subdirs
+    index_sets = [Set(dataset_datapoints(joinpath(dir, d))) for d in subdirs]
+    # an empty subdirectory would otherwise intersect everything down to nothing
+    nonempty = [s for s in index_sets if !isempty(s)]
+    isempty(nonempty) && return Int[], subdirs
+    return sort(collect(intersect(nonempty...))), subdirs
+end
+
+"""
+    generate_sensitivity_score_dataset(dataset_path; grainger = true, smoke = false)
+
+`compute_ac_pf_mult_buses(swap_technique = "sensitivity_score")` over every
+datapoint common to all subdirectories of `dataset_path`, into `acpf_ss/`;
+unconverged datapoints are skipped and printed. Also writes `metadata.xlsx`
+with per-datapoint feasibility, time, swap iterations and stop reason.
+"""
+function generate_sensitivity_score_dataset(dataset_path; grainger::Bool = true, max_acpf::Integer = 50, smoke::Bool = false, smoke_n::Integer = 10, obo = false, log_level::String = "error", batch_size::Int = 100)
+    PowerModels.logger_config!(log_level)
+
+    out_name = "acpf_ss"
+    out_dir = joinpath(dataset_path, out_name)
+
+    common_files, subdirs = common_datapoint_files(dataset_path; exclude = [out_name])
+    if isempty(subdirs)
+        error("generate_sensitivity_score_dataset: no subdirectories to scan under $dataset_path")
+    end
+    if isempty(common_files)
+        println("generate_sensitivity_score_dataset: no case file is present in all of $(subdirs) under $dataset_path")
+        return out_dir
+    end
+
+    mkpath(out_dir)
+
+    # smoke-test mode: only the first `smoke_n` datapoints
+    if smoke
+        common_files = common_files[1:min(smoke_n, end)]
+        println("generate_sensitivity_score_dataset: SMOKE mode -- first $(length(common_files)) datapoint(s) only: $common_files")
+    end
+
+    # any sibling will do: they share the perturbed parameters, only setpoints differ
+    source_dir = dp -> begin
+        "baseline_acpf" in subdirs && return joinpath(dataset_path, "baseline_acpf")
+        for d in subdirs
+            dp in dataset_datapoints(joinpath(dataset_path, d)) && return joinpath(dataset_path, d)
+        end
+        error("generate_sensitivity_score_dataset: datapoint $dp vanished from every subdirectory")
+    end
+
+    # stop_reason / *_remaining come from compute_ac_pf_mult_buses' instrumentation
+    metadata = DataFrame(datapoint = Int[], feasible = Bool[], time = Float64[], swap_iters = Int[],
+                         stop_reason = String[], pq_vm_viol_remaining = Int[],
+                         pv_qg_viol_remaining = Int[], pv_donors_left = Int[],
+                         recipients_no_donor = Int[], recipients_low_sens = Int[])
+
+    writer = H5Writer(joinpath(out_dir, "dataset.h5"))
+    ss_batch, ss_time = Any[], Float64[]
+    flush_ss! = () -> begin
+        isempty(ss_batch) && return
+        append_batch!(writer, ss_batch, ss_time, zeros(length(ss_batch)))
+        empty!(ss_batch); empty!(ss_time); GC.gc()
+    end
+
+    written, skipped = 0, Int[]
+    for (processed, datapoint) in enumerate(common_files)
+        test_case = load_datapoint(source_dir(datapoint), datapoint)
+
+        # keep_history = false: the history dominates memory on large networks
+        elapsed = @elapsed result = PowerModels.compute_ac_pf_mult_buses(test_case;
+                        grainger = grainger, swap_technique = "sensitivity_score",
+                        max_acpf = max_acpf, enforce_q_lims = true, keep_history = false, obo = obo)
+
+        solution = result["solution"]
+        swap_iters = length(get(result, "solution_history", []))
+        converged = result["termination_status"] === true &&
+                    solution !== nothing && haskey(solution, "bus") &&
+                    !any(b -> b["vm"] == -1, values(solution["bus"]))
+
+        stop_reason = get(result, "stop_reason", "unknown")
+        fd = get(result, "final_diagnostics", Dict{String,Any}())
+        sa = get(fd, "swap_attempt", Dict{String,Any}())
+        pq_vm_rem = Int(get(fd, "pq_vm_violations", -1))
+        pv_qg_rem = Int(get(fd, "pv_qg_violations", -1))
+        pv_donors_left = Int(get(fd, "pv_donor_buses_available", -1))
+        recip_no_donor = Int(get(sa, "recipients_no_candidate_donor", -1))
+        recip_low_sens = Int(get(sa, "recipients_low_sensitivity", -1))
+
+        # qg/vm bounds stay soft, so convergence alone doesn't mean they held
+        feasible = converged &&
+                   solution_feasibility(deepcopy(test_case), solution, Dict())["total_violations"] == 0
+        push!(metadata, (datapoint, feasible, elapsed, swap_iters, stop_reason,
+                         pq_vm_rem, pv_qg_rem, pv_donors_left, recip_no_donor, recip_low_sens))
+
+        if converged
+            # the merge store_datapoint! did, batched into dataset.h5
+            out_case = deepcopy(test_case)
+            for (ind, val) in solution["gen"]
+                out_case["gen"][ind]["pg"] = val["pg"]
+                out_case["gen"][ind]["qg"] = val["qg"]
+            end
+            for (ind, val) in solution["bus"]
+                out_case["bus"][ind]["va"] = val["va"]
+                out_case["bus"][ind]["vm"] = val["vm"]
+            end
+            out_case["datapoint"] = datapoint
+            push!(ss_batch, out_case); push!(ss_time, elapsed)
+            length(ss_batch) >= batch_size && flush_ss!()
+            written += 1
+        else
+            push!(skipped, datapoint)
+        end
+
+        # reclaim the solve's Jacobians now rather than when the GC decides to
+        result = nothing
+        GC.gc()
+
+        if processed % 50 == 0
+            println("generate_sensitivity_score_dataset: processed $processed/$(length(common_files)) (written $written, skipped $(length(skipped))) -- $out_dir")
+        end
+    end
+
+    flush_ss!()
+
+    metadata_path = joinpath(out_dir, "metadata.xlsx")
+    isfile(metadata_path) && rm(metadata_path)
+    XLSX.openxlsx(metadata_path, mode = "w") do xf
+        sheet = XLSX.addsheet!(xf, "metadata")
+        XLSX.writetable!(sheet, Tables.columntable(metadata))
+    end
+
+    println("generate_sensitivity_score_dataset: wrote $written cases to $(joinpath(out_dir, "dataset.h5"))")
+    if !isempty(skipped)
+        println("generate_sensitivity_score_dataset: skipped $(length(skipped)) unconverged datapoint(s), missing from $out_dir: $(sort(skipped))")
     end
     return out_dir
 end
@@ -773,11 +1077,8 @@ function _verify_loads_(test_case, loads, max_gen, min_gen, max_pd; qd_loads = n
 end
 
 """
-Per-branch `rate_a` (thermal rating) substituted into `max_pd` for a branch
-that has no `"rate_a"` at all (Matpower's convention for "no rating
-specified" -- see `prepare_test_case_perturbations`). Far above any real
-branch rating (typically single/low-double-digit per-unit), so it behaves as
-effectively unbounded without being a literal `Inf`.
+`rate_a` used in `max_pd` for an unrated branch: far above any real rating,
+so it acts as unbounded without being a literal `Inf`.
 """
 const UNRATED_BRANCH_MAX_PD = 1e6
 
@@ -793,13 +1094,7 @@ function prepare_test_case_perturbations(test_case)
     end
     max_pd = Dict{String, Float64}(bus => 0 for bus in keys(test_case["bus"]))
     for branch in values(test_case["branch"])
-        # PowerModels deletes "rate_a" entirely (rather than storing 0) for a
-        # branch whose Matpower RATE_A was 0, meaning "no thermal rating
-        # specified" -- treat that as effectively unbounded, not as
-        # contributing nothing: a bus with even one unrated incident branch
-        # has no meaningful cap from this heuristic. A large finite sentinel
-        # (rather than Inf) keeps max_pd an ordinary comparable/serializable
-        # Float64 everywhere else it's used.
+        # a missing rate_a means "unrated", so treat it as unbounded, not as zero
         rate_a = get(branch, "rate_a", UNRATED_BRANCH_MAX_PD)
         max_pd[string(branch["f_bus"])] = max_pd[string(branch["f_bus"])] + rate_a
         max_pd[string(branch["t_bus"])] = max_pd[string(branch["t_bus"])] + rate_a
@@ -887,9 +1182,7 @@ function generate_solutions(case_name, delta, test_case, load_data, file_pth, ru
                 println("Running ID $run_id: pf_type = $pf_type, obo = $obo")
                 run_pf!(test_case, load_data, run_flags, run_df, soln_df, violations_df, bi_df, num_samples)
             else
-                # `sensitivity_score` supports two extra knobs that other techniques ignore.
-                # Iterate over them only when relevant; defaults of [0] keep this loop the
-                # same shape as before for "nearest_gen" and "qv_inv".
+                # two extra knobs only sensitivity_score reads; [0] keeps the loop shape
                 smw_grid = get(run_dict, "use_smw_warmstart", [0])
                 collat_grid = get(run_dict, "score_collateral_aware", [0])
                 for swap_technique in run_dict["swap_techniques"]
@@ -1034,9 +1327,7 @@ end
 
 function generate_loads(test_case, num_points, delta, case_name; log_level::String = "warn")
     PowerModels.logger_config!(log_level)
-    # see the matching comment in generate_data: Ipopt's console output is a
-    # separate channel from PowerModels' logger, controlled by its own
-    # "print_level" option, not by `PowerModels.logger_config!`
+    # Ipopt's console output is its own channel, not PowerModels' logger
     ipopt_print_level = log_level == "error" ? 0 : 1
     ipopt = optimizer_with_attributes(Ipopt.Optimizer, "print_level" => ipopt_print_level)
     test_case, max_pd = prepare_test_case_perturbations(test_case)
@@ -1089,11 +1380,8 @@ function generate_loads(test_case, num_points, delta, case_name; log_level::Stri
 end
 
 """
-Merge a `compute_ac_pf` solution ("bus" vm/va, "gen" pg/qg) into a copy of
-`test_case` and write the result to `<out_dir>/<datapoint>.json`. Because the
-output is a full PowerModels case dict (perturbed parameters + solved
-setpoints baked in), it can be read straight back in later with
-`PowerModels.parse_file`/`PowerModels.parse_json`.
+Merge a solution's bus vm/va and gen pg/qg into a copy of `test_case` and
+write it to `<out_dir>/<datapoint>.json`, readable back with `parse_file`.
 """
 function store_datapoint!(test_case, solution, datapoint, out_dir)
     out_case = deepcopy(test_case)
@@ -1107,25 +1395,18 @@ function store_datapoint!(test_case, solution, datapoint, out_dir)
     end
     out_case["datapoint"] = datapoint
     filename = joinpath(out_dir, "$datapoint.json")
-    # pretty-print (4-space indent) so the file is easy to read by eye; keeps
-    # the same Inf/NaN -> "null" handling PowerModels.export_file uses so the
-    # file still round-trips through PowerModels.parse_file
+    # export_file's Inf/NaN -> null handling, so this round-trips through parse_file
     JSON.json(filename, out_case; pretty = 4, allownan = true, inf = "null", ninf = "null", nan = "null")
     return filename
 end
 
 """
-Run one perturb + DC-OPF-feasibility + AC-PF-feasibility attempt, starting
-from a fresh copy of `base_case`. Seeded internally from `seed` first thing,
-so a given attempt index always draws the same perturbation regardless of
-when/how often `generate_data` has been called before it.
-
-Returns `(:success, pert_case, solution)` on a feasible attempt, or
-`(:dcopf_infeasible,)` / `(:acpf_infeasible,)` on failure at that stage.
+One perturb + DC-OPF + AC-PF attempt off a fresh copy of `base_case`; the
+RNG is deliberately not seeded. Returns `(:success, pert_case, solution)`,
+`(:dcopf_infeasible,)` or `(:acpf_infeasible,)`.
 """
-function _generate_one_attempt(base_case, max_pd, pert_config, tap_changing_ids, phase_shifting_ids, ipopt, grainger, seed, log_level)
+function _generate_one_attempt(base_case, max_pd, pert_config, tap_changing_ids, phase_shifting_ids, ipopt, grainger, log_level)
     PowerModels.logger_config!(log_level)
-    Random.seed!(seed)
     # start every attempt from a fresh copy of the unperturbed base case
     pert_case = deepcopy(base_case)
 
@@ -1152,132 +1433,193 @@ function _generate_one_attempt(base_case, max_pd, pert_config, tap_changing_ids,
     pert_genstatus!(pert_case; num_gens = pert_config["genstatus"]["num_gens"])
 
     # verify test case is dcopf-feasible
-    model_dc = PowerModels.solve_dc_opf(pert_case, ipopt)
+    dcopf_time = @elapsed model_dc = PowerModels.solve_dc_opf(pert_case, ipopt)
     if model_dc["termination_status"] != LOCALLY_SOLVED
         return (:dcopf_infeasible,)
     end
-    # place dc gen setpoints into model
-    for (ind, val) in model_dc["solution"]["gen"]
-        pert_case["gen"][ind]["pg"] = val["pg"]
-    end
+    # warm start off DC-OPF: pg, angles into va_start, gen vg into vm_start when all have one
+    warmstart_pf_from_dc!(pert_case, model_dc["solution"])
     pert_linestatus!(pert_case; num_lines = pert_config["linestatus"]["num_lines"])
-    # solve traditional ac-pf
-    res = PowerModels.compute_ac_pf(pert_case, grainger=grainger, mapping=true)
+    # enforce_q_lims = false: PV->PQ switching often fails to converge on large networks
+    acpf_time = @elapsed res = PowerModels.compute_ac_pf(pert_case, grainger = grainger,
+                                                         mapping = true, enforce_q_lims = false)
     if !res["termination_status"]
         return (:acpf_infeasible,)
     end
-    return (:success, pert_case, res["solution"])
+    return (:success, pert_case, res["solution"], acpf_time, dcopf_time)
+end
+
+"""
+    warmstart_pf_from_dc!(case, dc_solution)
+
+Seed an AC-PF solve from a DC-OPF solution: dispatch into gen `pg`, angles into
+`va_start`, gen `vg` into `vm_start` when every in-service generator has one.
+"""
+function warmstart_pf_from_dc!(case, dc_solution)
+    for (i, gen) in get(dc_solution, "gen", Dict())
+        haskey(case["gen"], i) && haskey(gen, "pg") && (case["gen"][i]["pg"] = gen["pg"])
+    end
+    for (i, bus) in get(dc_solution, "bus", Dict())
+        haskey(case["bus"], i) && haskey(bus, "va") && (case["bus"][i]["va_start"] = bus["va"])
+    end
+    live_gens = [g for g in values(case["gen"]) if get(g, "gen_status", 1) != 0]
+    if !isempty(live_gens) && all(g -> haskey(g, "vg"), live_gens)
+        for g in live_gens
+            b = string(g["gen_bus"])
+            haskey(case["bus"], b) && (case["bus"][b]["vm_start"] = g["vg"])
+        end
+    end
+    return case
 end
 
 """
     generate_data(test_case, num_points, case_name, out_name; kwargs...)
 
-Generates up to `2*num_points` perturbation attempts, one at a time (via
-`_generate_one_attempt`), stopping once `num_points` feasible datapoints have
-been written or `2*num_points` attempts have been made, whichever comes
-first.
+Perturbation attempts until `baseline_acpf/dataset.h5` holds `num_points`
+datapoints or `time_budget_s` runs out. `num_points` is a dataset target, so a
+second call tops it up. Written in batches of `batch_size`, with solve times.
 """
-function generate_data(test_case, num_points, case_name, out_name; pert_config_path::Union{Nothing, AbstractString} = "default_pert.json", log_level::String = "warn", grainger::Bool = true)
+function generate_data(test_case, num_points, case_name, out_name;
+                       pert_config_path::Union{Nothing, AbstractString} = "default_pert.json",
+                       log_level::String = "warn", grainger::Bool = true,
+                       batch_size::Int = 100, time_budget_s::Real = Inf)
     PowerModels.logger_config!(log_level)
-    # Ipopt's console output (its banner + per-solve summary) is a completely
-    # separate channel from PowerModels' logger above -- it's the solver's
-    # own C library printing directly to stdout via the "print_level" MOI
-    # option, not something `PowerModels.logger_config!` has any control
-    # over. Tie it to the same log_level so "quiet" actually means quiet.
+    # Ipopt prints from its own C library, so tie print_level to log_level too
     ipopt_print_level = log_level == "error" ? 0 : 1
     ipopt = optimizer_with_attributes(Ipopt.Optimizer, "print_level" => ipopt_print_level)
-    # pert_config_path is just a filename (or an absolute path) -- resolve it
-    # against the stored perturbation_configs directory so this works
-    # regardless of the shell's current working directory
+    # resolve the config filename against perturbation_configs, whatever the cwd is
     resolved_pert_config_path = pert_config_path === nothing ? nothing : joinpath(PERTURBATION_CONFIGS_DIR, pert_config_path)
     pert_config = load_perturbation_config(resolved_pert_config_path)
 
-    # og_pd/og_qd and max_pd are computed once off of the untouched base case;
-    # every attempt perturbs a fresh deepcopy of this base case, so
-    # perturbations never accumulate/carry over between attempts
+    # off the untouched base case, so perturbations never accumulate between attempts
     base_case, max_pd = prepare_test_case_perturbations(deepcopy(test_case))
-    # classified once off the base case; every attempt perturbs a fresh
-    # deepcopy of base_case with the same branch IDs, so these stay valid
+    # branch IDs are the same in every attempt, so one classification stays valid
     tap_changing_ids, phase_shifting_ids = classify_transformers(base_case)
 
-    out_dir = joinpath(TESTCASE_PATH, "data", case_name, out_name)
+    out_dir = joinpath(TESTCASE_PATH, "data", case_name, out_name, "baseline_acpf")
     mkpath(out_dir)
+    writer = H5Writer(joinpath(out_dir, "dataset.h5"))
 
-    # resume numbering after whatever's already in out_dir instead of
-    # starting at 0 and overwriting existing datapoint files. Only files
-    # named as a bare integer (the store_datapoint! naming convention) count
-    # -- this is the same filter solution_analysis.jl's analyze_dataset uses
-    # to find datapoint files, so a leftover violation_summary.json (or
-    # anything else) doesn't get mistaken for one.
-    existing_samples = filter(f -> occursin(r"^\d+\.json$", f), readdir(out_dir))
-    curr_samps = isempty(existing_samples) ? 0 : maximum(parse(Int, splitext(f)[1]) for f in existing_samples) + 1
+    # resume, not overwrite: num_points is the dataset target, so only the shortfall is run
+    existing = dataset_datapoints(out_dir)
+    curr_samps = isempty(existing) ? 0 : maximum(existing) + 1
+    n_existing = length(existing)
+    to_generate = num_points - n_existing
+    if to_generate <= 0
+        @printf("generate_data: %s already has %d datapoints (target %d) -- nothing to do\n",
+                case_name, n_existing, num_points)
+        return n_existing
+    end
+    if n_existing > 0
+        @printf("generate_data: %s has %d datapoints, generating %d more to reach %d (new indices start at %d)\n",
+                case_name, n_existing, to_generate, num_points, curr_samps)
+    end
 
     counter = 0
     infeas_dcopf = 0
     infeas_acpf = 0
     total_counter = 0
-    max_attempts_total = 2 * num_points
-    while counter < num_points && total_counter < max_attempts_total
+    t0 = time()
+    batch, batch_acpf, batch_dcopf = Any[], Float64[], Float64[]
+
+    function flush_batch!()
+        isempty(batch) && return
+        append_batch!(writer, batch, batch_acpf, batch_dcopf)
+        flush(stdout)
+        empty!(batch); empty!(batch_acpf); empty!(batch_dcopf)
+        GC.gc()
+    end
+
+    while counter < to_generate
         total_counter += 1
         result = _generate_one_attempt(base_case, max_pd, pert_config,
-                        tap_changing_ids, phase_shifting_ids, ipopt, grainger, total_counter, log_level)
+                        tap_changing_ids, phase_shifting_ids, ipopt, grainger, log_level)
         if result[1] == :dcopf_infeasible
             infeas_dcopf += 1
         elseif result[1] == :acpf_infeasible
             infeas_acpf += 1
         else
-            _, pert_case, solution = result
-            store_datapoint!(pert_case, solution, curr_samps + counter, out_dir)
+            _, pert_case, solution, acpf_time, dcopf_time = result
+            # same merge store_datapoint! did, but into memory rather than a file
+            out_case = deepcopy(pert_case)
+            for (ind, val) in solution["gen"]
+                out_case["gen"][ind]["pg"] = val["pg"]
+                out_case["gen"][ind]["qg"] = val["qg"]
+            end
+            for (ind, val) in solution["bus"]
+                out_case["bus"][ind]["va"] = val["va"]
+                out_case["bus"][ind]["vm"] = val["vm"]
+            end
+            out_case["datapoint"] = curr_samps + counter
+            push!(batch, out_case); push!(batch_acpf, acpf_time); push!(batch_dcopf, dcopf_time)
             counter += 1
+            length(batch) >= batch_size && flush_batch!()
         end
         if total_counter % 10 == 0
             println("counter = $counter, dcopf_counter = $infeas_dcopf, acpf_counter = $infeas_acpf, total = $total_counter")
+            flush(stdout)
+        end
+    
+        if time() - t0 > time_budget_s
+            @printf("generate_data: time budget (%.0fs) reached for %s after %d datapoints -- stopping\n",
+                    time_budget_s, case_name, counter)
+            break
         end
     end
-    println("generate_data: wrote $counter datapoints (indices $curr_samps:$(curr_samps + counter - 1)) to $out_dir ($infeas_dcopf dcopf-infeasible, $infeas_acpf acpf-infeasible skipped)")
-    return counter
+    flush_batch!()
+    @printf("generate_data: wrote %d datapoints to %s in %.1fs (%d dcopf-infeasible, %d acpf-infeasible skipped)\n",
+            writer.n, joinpath(out_dir, "dataset.h5"), time() - t0, infeas_dcopf, infeas_acpf)
+    return writer.n
 end
+
+
 
 function main()
     PowerModels.logger_config!("error")
     PERT_NAME = "extreme_pert"
-    for CASE_NAME in [ "case7336"]
-        file_pth = joinpath(DATA_PATH, "test_cases/data/$CASE_NAME/$PERT_NAME")
-        println("running opf for case $CASE_NAME (no device)...")
-        generate_optimal_dataset(file_pth; device=false)
-        println("running opf for case $CASE_NAME (device)...")
-        generate_optimal_dataset(file_pth; device=true)
+    # for CASE_NAME in [ "case14", "case57", "case300"]
+    #     file_pth = joinpath(DATA_PATH, "test_cases/data/$CASE_NAME/$PERT_NAME")
+    #     # println("running opf for case $CASE_NAME (no device)...")
+    #     # generate_optimal_dataset(file_pth; device=false, smoke=true)
+    #     # println("running opf for case $CASE_NAME (device)...")
+    #     # generate_optimal_dataset(file_pth; device=true, smoke=true)
+    #     println("running sensitivity_score ac-pf for case $CASE_NAME...")
+    #     generate_sensitivity_score_dataset(file_pth; grainger=true, max_acpf=30, smoke=true, obo = true)
+    # end
+    # for CASE_NAME in [ "case7336"]
+    #     file_pth = joinpath(DATA_PATH, "test_cases/data/$CASE_NAME/$PERT_NAME")
+    #     println("running opf for case $CASE_NAME (no device)...")
+    #     generate_optimal_dataset(file_pth; device=false)
+    #     println("running opf for case $CASE_NAME (device)...")
+    #     generate_optimal_dataset(file_pth; device=true)
+    #     println("running sensitivity_score ac-pf for case $CASE_NAME...")
+    #     generate_sensitivity_score_dataset(file_pth; grainger=true)
+    # end
+
+    CASES = [ "case9241_pegase"]
+    NUM_POINTS = 1000
+    BATCH_SIZE = 100
+    TIME_BUDGET_S = 1.5 * 60 * 60   # per case; a case that overruns is abandoned
+
+    for CASE_NAME in CASES
+        println("\n", "="^70)
+        println("generating $NUM_POINTS datapoints for $CASE_NAME ($PERT_NAME)")
+        println("="^70)
+        flush(stdout)
+        try
+            file_pth = joinpath(DATA_PATH, "test_cases/network_info/$CASE_NAME/$(CASE_NAME).m")
+            test_case = prepare_test_case(PowerModels.parse_file(file_pth), CASE_NAME, file_pth)
+            n = generate_data(test_case, NUM_POINTS, CASE_NAME, PERT_NAME;
+                              pert_config_path = "$PERT_NAME.json",
+                              log_level = "error",
+                              batch_size = BATCH_SIZE,
+                              time_budget_s = TIME_BUDGET_S)
+            println("$CASE_NAME: done -- $n datapoints")
+        catch e
+            println("$CASE_NAME: FAILED -- $(sprint(showerror, e))")
+        end
+        GC.gc()
+        flush(stdout)
     end
 
-    for CASE_NAME in ["case300","case2869_pegase" ]
-        println("generating data for $CASE_NAME...")
-        # CASE_NAME = "case7336"
-        PERT_NAME = "extreme_pert"
-        file_pth = joinpath(DATA_PATH, "test_cases/network_info/$CASE_NAME/$(CASE_NAME).m")
-        test_case = PowerModels.parse_file(file_pth)
-        test_case = prepare_test_case(test_case, CASE_NAME, file_pth)
-        counter = generate_data(test_case, 1000, CASE_NAME, PERT_NAME;
-                            pert_config_path="$PERT_NAME.json",
-                            log_level = "error"
-                            )
-    end
-
-
-
-    # # calculate delta
-    # max_pg = sum([gen["pmax"] for gen in values(test_case["gen"])])
-    # base_load = sum([load["pd"] for load in values(test_case["load"])])
-    # delta = round(0.85*max_pg/base_load - 1, digits=2)
-    # delta -= 0.03
-
-    # # pull in loads and generate dataset
-    # run_dict = Dict("pf_types" => ["mbuses", "qlim", "baseline"],
-    #                 "obo" => [0,1], "grainger" => [0,1],
-    #                 "swap_techniques" => ["nearest_gen", "qv_inv", "sensitivity_score"],
-    #                 # sensitivity_score-specific knobs (0=off, 1=on); other techniques ignore.
-    #                 "use_smw_warmstart"      => [0, 1],
-    #                 "score_collateral_aware" => [0],
-    #             )
-    # load_data = DataFrame(XLSX.readtable(joinpath(TESTCASE_PATH, "data/$(CASE_NAME)/loads/$delta.xlsx"), "loads"))
-    # generate_solutions(CASE_NAME, delta, test_case, load_data, file_pth, run_dict; num_samples = 10, write_out = true)
 end

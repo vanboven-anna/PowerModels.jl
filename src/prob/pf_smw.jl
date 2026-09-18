@@ -462,6 +462,16 @@ function perform_bus_swaps_sensitivity_score_impl!(pf_data, mapping_dict, jacobi
     # used by perform_bus_swaps! but the embedded-form path re-derives everything
     # from pf_data, so they are not used here.
     mapping_dict, jacobian, bus_type_idx
+    # picked up by compute_ac_pf_mult_buses for result["final_diagnostics"]
+    diag = Dict{String,Any}(
+        "b1_violations" => length(b1_violations),
+        "pv_donor_buses_available" => length(pf_data.data["pv_bus_inds"]),
+        "recipients_no_candidate_donor" => 0,
+        "recipients_low_sensitivity" => 0,
+        "swaps_applied" => 0,
+        "fell_back_to_nearest_gen" => false,
+    )
+    pf_data.data["_swap_diag"] = diag
     if isempty(b1_violations)
         return
     end
@@ -474,6 +484,7 @@ function perform_bus_swaps_sensitivity_score_impl!(pf_data, mapping_dict, jacobi
         Jhat, emap = build_embedded_jacobian(pf_data, p_pqv_pairs)
     catch e
         @_debug("sensitivity_score: failed to build embedded jacobian ($e); falling back to nearest_gen")
+        diag["fell_back_to_nearest_gen"] = true
         return perform_bus_swaps_nearest_gen!(pf_data, bus_assignment, p_pqv_pairs,
                                               b1_violations, swap, flags)
     end
@@ -502,6 +513,7 @@ function perform_bus_swaps_sensitivity_score_impl!(pf_data, mapping_dict, jacobi
             push!(candidates, i)
         end
         if isempty(candidates)
+            diag["recipients_no_candidate_donor"] += 1
             continue
         end
 
@@ -511,6 +523,7 @@ function perform_bus_swaps_sensitivity_score_impl!(pf_data, mapping_dict, jacobi
             z_dict = compute_sensitivity_columns(Jhat, emap, candidates)
         catch e
             @_debug("sensitivity_score: singular embedded jacobian ($e); falling back to nearest_gen")
+            diag["fell_back_to_nearest_gen"] = true
             return perform_bus_swaps_nearest_gen!(pf_data, bus_assignment, p_pqv_pairs,
                                                   b1_violations, swap, flags)
         end
@@ -523,6 +536,7 @@ function perform_bus_swaps_sensitivity_score_impl!(pf_data, mapping_dict, jacobi
         donor = score_result[1]
         sens  = score_result[3]
         if donor === nothing || abs(sens) < 1e-10
+            diag["recipients_low_sensitivity"] += 1
             continue
         end
 
@@ -541,6 +555,7 @@ function perform_bus_swaps_sensitivity_score_impl!(pf_data, mapping_dict, jacobi
         end
     end
 
+    diag["swaps_applied"] = length(swap_donors)
     if isempty(swap_donors)
         return
     end

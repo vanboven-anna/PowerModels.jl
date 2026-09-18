@@ -193,7 +193,7 @@ end
 
 Base.@kwdef struct SwapFlags
     mapping = false # for basic PF: use mapping dictionary vs. using indexing
-    enforce_q_lims = true # for basic PF: include q lims or not
+    enforce_q_lims = false # for basic PF: PV->PQ switch on gen Q-limit violations. off by default: it often fails to converge on large stiff cases
     obo = false  # one-by-one: can you perform one type-switch each iteration, or multiple?
     flat_start = false # flat start each iter vs. warmstart with the prev soln
     max_acpf = 50 # max iters before returning best solution thus far
@@ -204,6 +204,7 @@ Base.@kwdef struct SwapFlags
     swap_technique = "nearest_gen" # swap technique to determine the best P-PQV pairs
     score_collateral_aware = false # sensitivity_score: use Corollary-1 collateral-aware donor score
     use_smw_warmstart = false # sensitivity_score: seed next NR with SMW first-Newton-step prediction
+    keep_history = true # keep every iteration's Jacobian / x / mapping dict; off keeps only the last, the dominant memory cost on large networks
     debug = false
 end
 
@@ -333,7 +334,7 @@ function compute_ac_pf(pf_data::PowerFlowData; kwargs...)
     mapping = flags.mapping
     enforce_q_lims = flags.enforce_q_lims
     flat_start = flags.flat_start
-    filtered_kwargs = NamedTuple(filter(kv -> ~(kv[1] in [:enforce_q_lims, :mapping, :flat_start]), kwargs))
+    filtered_kwargs = NamedTuple(filter(kv -> ~(kv[1] in [:enforce_q_lims, :mapping, :flat_start, :keep_history]), kwargs))
     time_start = time()
     is_feas = false
     pf_result = nothing
@@ -352,23 +353,29 @@ function compute_ac_pf(pf_data::PowerFlowData; kwargs...)
         @_debug( "computing ac pf, iteration $(acpf_counter)... ")
         if mapping
             mapping_dict, J0_map = map_types_to_variable_indices(pf_data; grainger = flags.grainger)
-            push!(mapping_dicts, mapping_dict)
-            if flags.grainger 
-             pf_result, jacobian, x_hist = _compute_ac_pf_grainger(pf_data, mapping_dict, J0_map, flat_start=flags.flat_start)  
-            else 
-                pf_result, jacobian, x_hist = _compute_ac_pf(pf_data, mapping_dict, J0_map, flat_start=flags.flat_start)   
-            end            
-            x_history = vcat(x_history, x_hist)
-            push!(x_history, [])
-            jacobian_history = vcat(jacobian_history, jacobian)
-            push!(jacobian_history, [])
+            if flags.keep_history
+                push!(mapping_dicts, mapping_dict)
+            end
+            if flags.grainger
+             pf_result, jacobian, x_hist = _compute_ac_pf_grainger(pf_data, mapping_dict, J0_map, flat_start=flags.flat_start, keep_history=flags.keep_history)
+            else
+                pf_result, jacobian, x_hist = _compute_ac_pf(pf_data, mapping_dict, J0_map, flat_start=flags.flat_start, keep_history=flags.keep_history)
+            end
+            if flags.keep_history
+                x_history = vcat(x_history, x_hist)
+                push!(x_history, [])
+                jacobian_history = vcat(jacobian_history, jacobian)
+                push!(jacobian_history, [])
+            end
         else
-            pf_result, jacobian, x_hist = _compute_ac_pf(pf_data, flat_start=flat_start; filtered_kwargs...)
-            x_history = vcat(x_history, x_hist)
-            push!(x_history, [])
-            jacobian_history = vcat(jacobian_history, jacobian)
-            push!(jacobian_history, [])
-        end 
+            pf_result, jacobian, x_hist = _compute_ac_pf(pf_data, flat_start=flat_start, keep_history=flags.keep_history; filtered_kwargs...)
+            if flags.keep_history
+                x_history = vcat(x_history, x_hist)
+                push!(x_history, [])
+                jacobian_history = vcat(jacobian_history, jacobian)
+                push!(jacobian_history, [])
+            end
+        end
         
         acpf_counter += 1
         is_feas = true
@@ -659,7 +666,24 @@ function _assign_qg!(sol_gens::Dict{String,<:Any}, bus_gens::Vector, qg_remainin
 end
 
 
-function _compute_ac_pf(pf_data::PowerFlowData; finite_differencing=false, flat_start=false,  kwargs...)
+"""
+Record one Newton-Raphson iterate. `keep` appends the full trace; otherwise
+only the last iterate is held, so `history[end]` still works but memory stays
+O(1) rather than growing with the iteration count.
+"""
+function _record_iterate!(jacobian_history, x_history, J, x, keep::Bool)
+    Jc, xc = deepcopy(J), deepcopy(x)
+    if keep || isempty(jacobian_history)
+        push!(jacobian_history, Jc)
+        push!(x_history, xc)
+    else
+        jacobian_history[end] = Jc
+        x_history[end] = xc
+    end
+    return nothing
+end
+
+function _compute_ac_pf(pf_data::PowerFlowData; finite_differencing=false, flat_start=false, keep_history::Bool=true, kwargs...)
     data = pf_data.data
     am = pf_data.am
     bus_type_idx = pf_data.bus_type_idx
@@ -779,8 +803,7 @@ function _compute_ac_pf(pf_data::PowerFlowData; finite_differencing=false, flat_
                 end
             end
         end
-        push!(jacobian_history, deepcopy(J))
-        push!(x_history, deepcopy(x))
+        _record_iterate!(jacobian_history, x_history, J, x, keep_history)
     end
 
 
@@ -1102,8 +1125,12 @@ function compute_ac_pf_mult_buses(pf_data::PowerFlowData; kwargs...)
     best_solution = _prep_best_solution_(pf_data)
     non_convergence = 0
     pf_data.data["pv_bus_inds"] = [i for (i, bt) in enumerate(pf_data.bus_type_idx) if bt == 2]
-    jacobian = nothing 
+    jacobian = nothing
     pf_data.data["prev_swaps"] = Dict(bus=> [] for bus in 1:length(pf_data.bus_type_idx))
+    # why the outer loop ended; overwritten as the loop discovers the actual cause
+    stop_reason = "max_acpf_reached"
+    # the last converged iteration's open violations and swap-search state
+    final_diag = Dict{String,Any}()
     time_start = time()
     while (~is_feas) & (acpf_counter <= flags.max_acpf)
         @_debug( "computing ac pf, iteration $(acpf_counter)... ")
@@ -1116,24 +1143,27 @@ function compute_ac_pf_mult_buses(pf_data::PowerFlowData; kwargs...)
         # compute ac power flow
         pf_result, jacobian, x_hist = nothing, nothing, nothing
         try
-            if flags.grainger 
-                pf_result, jacobian, x_hist = _compute_ac_pf_grainger(pf_data, mapping_dict, J0_map, flat_start=flags.flat_start) 
-            else 
-                pf_result, jacobian, x_hist = _compute_ac_pf(pf_data, mapping_dict, J0_map; flat_start = flags.flat_start) 
+            if flags.grainger
+                pf_result, jacobian, x_hist = _compute_ac_pf_grainger(pf_data, mapping_dict, J0_map, flat_start=flags.flat_start, keep_history=flags.keep_history)
+            else
+                pf_result, jacobian, x_hist = _compute_ac_pf(pf_data, mapping_dict, J0_map; flat_start = flags.flat_start, keep_history=flags.keep_history)
             end
-        catch e 
+        catch e
             # @infiltrate flags.debug
             rethrow(e)
             pf_result.x_converged = false
             pf_result.f_converged = false
             non_convergence = 5
         end
-        # store jacobian, x, and mapping for analysis 
-        jacobian_history = vcat(jacobian_history, jacobian)
-        x_history = vcat(x_history, x_hist)
-        push!(x_history, [])
-        push!(jacobian_history, [])
-        mapping_dicts = vcat(mapping_dicts, mapping_dict)
+        # `jacobian` stays local either way for perform_bus_swaps!; only the
+        # across-iteration history, which grows without bound, is optional
+        if flags.keep_history
+            jacobian_history = vcat(jacobian_history, jacobian)
+            x_history = vcat(x_history, x_hist)
+            push!(x_history, [])
+            push!(jacobian_history, [])
+            mapping_dicts = vcat(mapping_dicts, mapping_dict)
+        end
         is_feas = true # start by assuming solution has no violations
         solution = Dict("per_unit" => pf_data.data["per_unit"])
         converged = pf_result.x_converged || pf_result.f_converged 
@@ -1141,6 +1171,7 @@ function compute_ac_pf_mult_buses(pf_data::PowerFlowData; kwargs...)
             non_convergence += 1
             @_debug( "ac power flow solver convergence failed!")
             if (acpf_counter > flags.max_acpf) || (non_convergence > 5)
+                stop_reason = non_convergence > 5 ? "nonconvergence" : "max_acpf_reached"
                 solution = best_solution["solution"]
                 bus_type_idx = best_solution["bus_type_idx"]
                 pf_data = best_solution["pf_data"]
@@ -1250,17 +1281,34 @@ function compute_ac_pf_mult_buses(pf_data::PowerFlowData; kwargs...)
             push!(soln_history, solution)
             score = flags.minimize_mag ? violation_mag[] : num_violations[]
             update_best_solution!(best_solution, old_pfd, score, solution, old_pairs, bus_type_idx, mapping_dict)
+            # open violations and the donor pool, before the swap attempt mutates them
+            final_diag = Dict{String,Any}(
+                "iteration" => acpf_counter,
+                "score" => score,
+                "num_violations" => num_violations[],
+                "pq_vm_violations" => length(b1_violations),   # type-1 (PQ) bus vm out of band
+                "pv_qg_violations" => length(b2_violations),   # type-2 (PV) gen qg out of band
+                "donor_vm_violations" => length(b6v_violations),
+                "donor_qg_violations" => length(b6q_violations),
+                "pv_donor_buses_available" => length(get(pf_data.data, "pv_bus_inds", Int[])),
+            )
             # swap buses for next iteration
             perform_bus_swaps!(pf_data, mapping_dict, bus_type_idx, p_pqv_pairs, jacobian[end],
                             bus_assignment, swap, violations, flags)
+            # the sensitivity_score path leaves its per-recipient breakdown here
+            let sd = pop!(pf_data.data, "_swap_diag", nothing)
+                sd === nothing || (final_diag["swap_attempt"] = sd)
+            end
             if score <= 1e-4
                 @_debug( "Feasible Run")
+                stop_reason = "feasible"
                 is_feas = true
                 break
             else
                 is_feas = ~swap[]
             end
             if is_feas
+                stop_reason = "no_swap_available"
                 @_debug( "Ending with $(score), but no swap")
             end
             # Sherman-Morrison warm-start hook: perform_bus_swaps! may have
@@ -1297,10 +1345,13 @@ function compute_ac_pf_mult_buses(pf_data::PowerFlowData; kwargs...)
         "solution_history" => soln_history,
         "solve_time" => time() - time_start, 
         "pf_data" => best_solution["pf_data"],
-        "jacobian_history" => jacobian_history, 
+        "jacobian_history" => jacobian_history,
         "x_history" => x_history,
-        "mapping_dicts" => mapping_dicts, 
-        "delta_x" => delta_x
+        "mapping_dicts" => mapping_dicts,
+        "delta_x" => delta_x,
+        # "feasible", "no_swap_available", "max_acpf_reached" or "nonconvergence"
+        "stop_reason" => stop_reason,
+        "final_diagnostics" => final_diag,
     )
     return result
 end
@@ -1621,8 +1672,8 @@ function update_pf_data!(pf_data, best_solution)
 end
 
 "Compute AC-Power flow using the methology outlined in Grainger-Stevenson"
-function _compute_ac_pf_grainger(pf_data::PowerFlowData, mapping_dict, J0_map; 
-                                finite_differencing=false, flat_start=true, kwargs...)
+function _compute_ac_pf_grainger(pf_data::PowerFlowData, mapping_dict, J0_map;
+                                finite_differencing=false, flat_start=true, keep_history::Bool=true, kwargs...)
     data = pf_data.data
     am = pf_data.am
     bus_type_idx = pf_data.bus_type_idx
@@ -1752,8 +1803,7 @@ function _compute_ac_pf_grainger(pf_data::PowerFlowData, mapping_dict, J0_map;
             end
 
         end
-        push!(jacobian_history, deepcopy(J))
-        push!(x_history, deepcopy(x))
+        _record_iterate!(jacobian_history, x_history, J, x, keep_history)
     end
 
     # after solving for vm and va, find the reactive power for generators and real power for slack bus
@@ -1908,8 +1958,8 @@ function _compute_ac_pf_grainger(pf_data::PowerFlowData, mapping_dict, J0_map;
 end
 
 "Compute AC-Power flow using the regular methodology, but with a mapping dictionary"
-function _compute_ac_pf(pf_data::PowerFlowData, mapping_dict, J0_map; 
-                        finite_differencing=false, flat_start=true, kwargs...)
+function _compute_ac_pf(pf_data::PowerFlowData, mapping_dict, J0_map;
+                        finite_differencing=false, flat_start=true, keep_history::Bool=true, kwargs...)
     data = pf_data.data
     am = pf_data.am
     bus_type_idx = pf_data.bus_type_idx
@@ -2104,8 +2154,7 @@ function _compute_ac_pf(pf_data::PowerFlowData, mapping_dict, J0_map;
         end
 
 
-        push!(jacobian_history, deepcopy(J))
-        push!(x_history, deepcopy(x))
+        _record_iterate!(jacobian_history, x_history, J, x, keep_history)
     end
 
 

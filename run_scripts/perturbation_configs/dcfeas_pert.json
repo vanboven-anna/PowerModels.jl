@@ -1,0 +1,43 @@
+{
+    "load": {
+        "global_scale_delta": 0.20,
+        "jitter_delta": 0.05
+    },
+    "gencost": {
+        "shuffle_fraction": 0.20
+    },
+    "gen": {
+        "squeeze_fraction": 0.0,
+        "max_squeeze_pct": 0.0
+    },
+    "vsqueeze": {
+        "bus_fraction": 0.30,
+        "max_squeeze_pct": 0.10
+    },
+    "vasqueeze": {
+        "line_fraction": 0.0,
+        "max_squeeze_pct": 0.0
+    },
+    "thermal_squeeze": {
+        "line_fraction": 0.0,
+        "max_squeeze_pct": 0.0
+    },
+    "shunt": {
+        "bs_delta": 0.05,
+        "shunt_fraction": 0.30
+    },
+    "tap": {
+        "max_steps": 10,
+        "tap_fraction": 0.30
+    },
+    "shift": {
+        "max_steps": 10,
+        "shift_fraction": 0.30
+    },
+        "genstatus": {
+        "num_gens": 2
+    },
+    "linestatus": {
+        "num_lines": 2
+    }
+}

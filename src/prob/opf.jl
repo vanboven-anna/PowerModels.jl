@@ -20,6 +20,10 @@ function solve_dc_ac_pf(file, optimizer; kwargs...)
     return solve_model(file, ACPPowerModel, optimizer, build_dc_ac_pf; kwargs...)
 end
 
+function solve_dc_ac_device_pf(file, optimizer; kwargs...)
+    return solve_model(file, ACPPowerModel, optimizer, build_dc_ac_device_pf; kwargs...)
+end
+
 """
     build_opf(pm::AbstractPowerModel)
 """
@@ -56,43 +60,42 @@ function build_opf(pm::AbstractPowerModel)
     end
 end
 
-"""
-    build opf for distance maximization, all else equal 
-"""
-function build_ac_setpoint_max(pm::AbstractPowerModel)
 
-end
+const DC_AC_PF_SOFT_BOUND_PENALTY = 1e3
 
 """
-    build_dc_ac_pf for setpoint minimization
+    build_dc_ac_pf for voltage setpoint minimization
+
+Given a fixed active-power dispatch (`pg` pinned exactly to `pg_start` for
+every non-slack generator) and initial generator voltage setpoints (`vg`),
+finds the AC-feasible operating point that minimizes the total squared change
+to those voltage setpoints. Generator reactive-power limits (qmin/qmax) and
+bus voltage-magnitude limits (vmin/vmax) are kept soft: violable, but at a
+very high penalty (`DC_AC_PF_SOFT_BOUND_PENALTY`), so the model stays
+solvable (rather than becoming infeasible outright) if no fully-in-bounds
+AC-feasible point exists near the given setpoints.
 """
 function build_dc_ac_pf(pm::AbstractPowerModel)
-    vm, va = variable_bus_voltage(pm)
-    pgs, pg_sps, qgs = variable_gen_power(pm)
+    vm, va = variable_bus_voltage(pm; bounded = false)
+    pg, pg_sps = variable_gen_power_real(pm)
+    qg = variable_gen_power_imaginary(pm; bounded = false)
     variable_branch_power(pm)
-    #variable_dcline_power(pm)
+    variable_dcline_power(pm)
 
     vm_sps = []
     vm_gens = []
-    va_sps = []
-    
+
     for i in ids(pm, :gen)
         push!(vm_sps, pm.data["gen"][string(i)]["vg"])
         push!(vm_gens, var(pm, nw_id_default, :vm, pm.data["gen"][string(i)]["gen_bus"]))
     end
-    @infiltrate debug
+
     constraint_model_voltage(pm)
-    constraint_generator_setpoint(pm, pgs, pg_sps)
-    constraint_vm_setpoint(pm, vm_gens, vm_sps)
-    # objective_min_vm_qg_va(pm, vm_gens, vm_sps, va, va_sps, qgs, qg_sps)
-    # objective_min_setpoint_dist(pm, pgs, pg_sps)
-    
 
-
-    # constraint_vm_setpoint(pm, vm_gens, vm_sps)
-    # for (pg, sp) in zip(pgs, pg_sps)
-    #     constraint_generator_setpoint(pm, pg, sp)
-    # end    
+    # hard generator setpoint: pg is fixed exactly at its target value
+    for (pg_i, sp) in zip(pg, pg_sps)
+        constraint_pbal_sp(pm, pg_i, sp)
+    end
 
     for i in ids(pm, :ref_buses)
         constraint_theta_ref(pm, i)
@@ -106,16 +109,201 @@ function build_dc_ac_pf(pm::AbstractPowerModel)
         constraint_ohms_yt_from(pm, i)
         constraint_ohms_yt_to(pm, i)
 
-        #constraint_voltage_angle_difference(pm, i)
+        constraint_voltage_angle_difference(pm, i)
 
-        # constraint_thermal_limit_from(pm, i)
-        # constraint_thermal_limit_to(pm, i)
+        constraint_thermal_limit_from(pm, i)
+        constraint_thermal_limit_to(pm, i)
     end
 
-    # for i in ids(pm, :dcline)
-    #     constraint_dcline_power_losses(pm, i)
-    # end
+    for i in ids(pm, :dcline)
+        constraint_dcline_power_losses(pm, i)
+    end
+
+    # objective: minimize the change to the generator voltage setpoints
     objective_min_vm_dist(pm, vm_gens, vm_sps)
+
+    # soft qg/vm bounds: build them as ordinary hard constraints, then use
+    # JuMP's PenaltyRelaxation (as in build_relaxed_opf) to turn them into
+    # soft constraints, adding penalty*slack terms on top of the objective
+    # set above rather than replacing it.
+
+    soft_bound_penalties = Dict{JuMP.MOI.ConstraintIndex, Float64}()
+    slack_bus = [bus["bus_i"] for (i, bus) in ref(pm, :bus) if bus["bus_type"] == 3][1]
+    for (i, gen) in ref(pm, :gen)
+        qg_ub = JuMP.@constraint(pm.model, 1.0 * qg[i] <= gen["qmax"])
+        qg_lb = JuMP.@constraint(pm.model, 1.0 * qg[i] >= gen["qmin"])
+        soft_bound_penalties[JuMP.index(qg_ub)] = DC_AC_PF_SOFT_BOUND_PENALTY
+        soft_bound_penalties[JuMP.index(qg_lb)] = DC_AC_PF_SOFT_BOUND_PENALTY
+    end
+    for (i, bus) in ref(pm, :bus)
+        vm_ub = JuMP.@constraint(pm.model, 1.0 * vm[i] <= bus["vmax"])
+        vm_lb = JuMP.@constraint(pm.model, 1.0 * vm[i] >= bus["vmin"])
+        soft_bound_penalties[JuMP.index(vm_ub)] = DC_AC_PF_SOFT_BOUND_PENALTY
+        soft_bound_penalties[JuMP.index(vm_lb)] = DC_AC_PF_SOFT_BOUND_PENALTY
+    end
+    relaxation_penalty = JuMP.MOI.Utilities.PenaltyRelaxation(soft_bound_penalties; default = nothing)
+    pm.data["soft_bound_penalty_dict"] = JuMP.MOI.modify(JuMP.backend(pm.model), relaxation_penalty)
+end
+
+"""
+    build_dc_ac_device_pf for voltage AND device-setpoint minimization
+
+Same skeleton as `build_dc_ac_pf` (fixed `pg`, soft `qg`/`vm` bounds, minimize
+generator voltage-setpoint change) but also treats a subset of the network's
+tunable devices as decision variables, so their setpoints can move too:
+  - transformer tap ratio, for every branch with `branch["is_tap"] == true`
+  - transformer phase shift, for every branch with `branch["is_shift"] == true`
+  - shunt susceptance (`bs`), for every shunt
+
+PowerModels' stock `constraint_ohms_yt_from`/`constraint_ohms_yt_to`/
+`constraint_power_balance` treat tap/shift/shunt-bs as fixed data baked
+directly into the nonlinear flow expressions, so they can't be reused as-is
+here -- `_device_pf_ohms_yt_from!`/`_device_pf_ohms_yt_to!`/
+`_device_pf_power_balance!` above are this function's own versions of those
+three constraints, matching `form/acp.jl`'s ACP implementations term-for-term
+except that a flagged branch/shunt's `tr`/`ti`/`tm`/`bs` are the JuMP
+variable created for it rather than its fixed data value. A branch that
+isn't `is_tap`/`is_shift` keeps its fixed `tap`/`shift`, same as always.
+
+The objective adds a squared-distance-from-setpoint term for each of
+tap/shift/bs on top of the generator voltage-setpoint term
+(`objective_min_vm_dist`). `tap`/`shift` are bounded by
+`branch["tmin"]/["tmax"]` and `branch["smin"]/["smax"]` when present, and
+left unbounded otherwise; `bs` is bounded by `shunt["bmin"]/["bmax"]` when
+present, unbounded otherwise. Unlike the `qg`/`vm` bounds inherited from
+`build_dc_ac_pf`, these are hard bounds, not soft/penalized ones.
+
+The solved `tap`/`shift`/`bs` values are written into the result's
+`"solution"` dict (`solution["branch"][i]["tap"/"shift"]`,
+`solution["shunt"][i]["bs"]`) alongside the usual `pf`/`qf`/`vm`/etc., so
+callers can read the continuous device setpoints straight off a successful
+solve.
+"""
+function build_dc_ac_device_pf(pm::AbstractPowerModel)
+    vm, va = variable_bus_voltage(pm; bounded = false)
+    pg, pg_sps = variable_gen_power_real(pm)
+    qg = variable_gen_power_imaginary(pm; bounded = false)
+    variable_branch_power(pm)
+    variable_dcline_power(pm)
+
+    vm_sps = []
+    vm_gens = []
+    for i in ids(pm, :gen)
+        push!(vm_sps, pm.data["gen"][string(i)]["vg"])
+        push!(vm_gens, var(pm, nw_id_default, :vm, pm.data["gen"][string(i)]["gen_bus"]))
+    end
+
+    # device variables: tap/shift only for flagged branches, bs for every shunt
+    tap_var = Dict{Int, Any}()
+    tap_sps = Dict{Int, Float64}()
+    shift_var = Dict{Int, Any}()
+    shift_sps = Dict{Int, Float64}()
+    for (i, branch) in ref(pm, :branch)
+        if get(branch, "is_tap", false)
+            v = JuMP.@variable(pm.model, base_name = "tap_$i", start = branch["tap"])
+            if haskey(branch, "tmin") && haskey(branch, "tmax")
+                JuMP.set_lower_bound(v, branch["tmin"])
+                JuMP.set_upper_bound(v, branch["tmax"])
+            end
+            tap_var[i] = v
+            tap_sps[i] = branch["tap"]
+        end
+        if get(branch, "is_shift", false)
+            v = JuMP.@variable(pm.model, base_name = "shift_$i", start = branch["shift"])
+            if haskey(branch, "smin") && haskey(branch, "smax")
+                JuMP.set_lower_bound(v, branch["smin"])
+                JuMP.set_upper_bound(v, branch["smax"])
+            end
+            shift_var[i] = v
+            shift_sps[i] = branch["shift"]
+        end
+    end
+
+    bs_var = Dict{Int, Any}()
+    bs_sps = Dict{Int, Float64}()
+    for (i, shunt) in ref(pm, :shunt)
+        v = JuMP.@variable(pm.model, base_name = "bs_$i", start = shunt["bs"])
+        if haskey(shunt, "bmin") && haskey(shunt, "bmax")
+            JuMP.set_lower_bound(v, shunt["bmin"])
+            JuMP.set_upper_bound(v, shunt["bmax"])
+        end
+        bs_var[i] = v
+        bs_sps[i] = shunt["bs"]
+    end
+
+    # expose the solved device setpoints in the result, same convention the
+    # stock `variable_*` functions use (see `sol_component_value` above)
+    for (i, v) in tap_var
+        sol(pm, nw_id_default, :branch, i)["tap"] = v
+    end
+    for (i, v) in shift_var
+        sol(pm, nw_id_default, :branch, i)["shift"] = v
+    end
+    for (i, v) in bs_var
+        sol(pm, nw_id_default, :shunt, i)["bs"] = v
+    end
+
+    constraint_model_voltage(pm)
+
+    # hard generator setpoint: pg is fixed exactly at its target value
+    for (pg_i, sp) in zip(pg, pg_sps)
+        constraint_pbal_sp(pm, pg_i, sp)
+    end
+
+    for i in ids(pm, :ref_buses)
+        constraint_theta_ref(pm, i)
+    end
+
+    for i in ids(pm, :bus)
+        _device_pf_power_balance!(pm, i, bs_var)
+    end
+
+    for (i, branch) in ref(pm, :branch)
+        tm = get(branch, "is_tap", false) ? tap_var[i] : branch["tap"]
+        shift = get(branch, "is_shift", false) ? shift_var[i] : branch["shift"]
+        tr = tm * cos(shift)
+        ti = tm * sin(shift)
+
+        _device_pf_ohms_yt_from!(pm, i, tr, ti, tm)
+        _device_pf_ohms_yt_to!(pm, i, tr, ti, tm)
+
+        constraint_voltage_angle_difference(pm, i)
+
+        constraint_thermal_limit_from(pm, i)
+        constraint_thermal_limit_to(pm, i)
+    end
+
+    for i in ids(pm, :dcline)
+        constraint_dcline_power_losses(pm, i)
+    end
+
+    # objective: minimize the change to the generator voltage setpoints,
+    # plus the change to every tap/shift/bs setpoint
+    objective_min_vm_dist(pm, vm_gens, vm_sps)
+    device_dist = sum((tap_sps[i] - tap_var[i])^2 for i in keys(tap_var); init = 0.0) +
+                  sum((shift_sps[i] - shift_var[i])^2 for i in keys(shift_var); init = 0.0) +
+                  sum((bs_sps[i] - bs_var[i])^2 for i in keys(bs_var); init = 0.0)
+    JuMP.set_objective_function(pm.model, JuMP.objective_function(pm.model) + device_dist)
+
+    # soft qg/vm bounds -- see build_dc_ac_pf for the full explanation of
+    # both gotchas (forcing affine form, and default = nothing)
+    soft_bound_penalties = Dict{JuMP.MOI.ConstraintIndex, Float64}()
+    slack_bus = [bus["bus_i"] for (i, bus) in ref(pm, :bus) if bus["bus_type"] == 3][1]
+    for (i, gen) in ref(pm, :gen)
+        gen["gen_bus"] == slack_bus && continue
+        qg_ub = JuMP.@constraint(pm.model, 1.0 * qg[i] <= gen["qmax"])
+        qg_lb = JuMP.@constraint(pm.model, 1.0 * qg[i] >= gen["qmin"])
+        soft_bound_penalties[JuMP.index(qg_ub)] = DC_AC_PF_SOFT_BOUND_PENALTY
+        soft_bound_penalties[JuMP.index(qg_lb)] = DC_AC_PF_SOFT_BOUND_PENALTY
+    end
+    for (i, bus) in ref(pm, :bus)
+        vm_ub = JuMP.@constraint(pm.model, 1.0 * vm[i] <= bus["vmax"])
+        vm_lb = JuMP.@constraint(pm.model, 1.0 * vm[i] >= bus["vmin"])
+        soft_bound_penalties[JuMP.index(vm_ub)] = DC_AC_PF_SOFT_BOUND_PENALTY
+        soft_bound_penalties[JuMP.index(vm_lb)] = DC_AC_PF_SOFT_BOUND_PENALTY
+    end
+    relaxation_penalty = JuMP.MOI.Utilities.PenaltyRelaxation(soft_bound_penalties; default = nothing)
+    pm.data["soft_bound_penalty_dict"] = JuMP.MOI.modify(JuMP.backend(pm.model), relaxation_penalty)
 end
 
 """

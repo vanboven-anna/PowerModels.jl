@@ -33,7 +33,7 @@ test_case = prepare_test_case(test_case, case_name, dset_dir)
 
 #  compute ac opf setpoint dist (the device=true pipeline lives in generate_dataset.jl)
 ipopt = Ipopt.Optimizer
-solve_dc_ac_pf!(test_case, ipopt; device = true)
+res = solve_dc_ac_pf!(test_case, ipopt; device = true)
 
 
 #  compute acpf 

@@ -64,22 +64,42 @@ end
 const DC_AC_PF_SOFT_BOUND_PENALTY = 1e3
 
 """
+Drop pmin/pmax on the slack-bus generators -- they are the ones
+`variable_gen_power_real` leaves unpinned, so they must be free to absorb
+losses. Every other generator keeps its hard pg bounds.
+"""
+function _free_slack_pg!(pm::AbstractPowerModel)
+    # the same slack pick variable_gen_power_real uses to exclude gens from pinning
+    slack_bus = [bus["bus_i"] for (i, bus) in ref(pm, :bus) if bus["bus_type"] == 3][1]
+    for (i, gen) in ref(pm, :gen)
+        gen["gen_bus"] in slack_bus || continue
+        v = var(pm, nw_id_default, :pg, i)
+        JuMP.has_lower_bound(v) && JuMP.delete_lower_bound(v)
+        JuMP.has_upper_bound(v) && JuMP.delete_upper_bound(v)
+    end
+end
+
+"""
     build_dc_ac_pf for voltage setpoint minimization
 
 Given a fixed active-power dispatch (`pg` pinned exactly to `pg_start` for
 every non-slack generator) and initial generator voltage setpoints (`vg`),
 finds the AC-feasible operating point that minimizes the total squared change
-to those voltage setpoints. Generator reactive-power limits (qmin/qmax) and
-bus voltage-magnitude limits (vmin/vmax) are kept soft: violable, but at a
-very high penalty (`DC_AC_PF_SOFT_BOUND_PENALTY`), so the model stays
-solvable (rather than becoming infeasible outright) if no fully-in-bounds
-AC-feasible point exists near the given setpoints.
+to those voltage setpoints. The constraint set is AC power balance and nothing
+else, so the model replicates an AC power flow rather than an OPF: no thermal
+limits, no angle-difference limits. The only bounds are generator
+reactive-power limits (qmin/qmax) and bus voltage-magnitude limits
+(vmin/vmax), and both are soft -- violable at a very high penalty
+(`DC_AC_PF_SOFT_BOUND_PENALTY`) -- so a bound violation shows up in the
+solution instead of making the model infeasible.
 """
 function build_dc_ac_pf(pm::AbstractPowerModel)
     vm, va = variable_bus_voltage(pm; bounded = false)
     pg, pg_sps = variable_gen_power_real(pm)
+    _free_slack_pg!(pm)
     qg = variable_gen_power_imaginary(pm; bounded = false)
-    variable_branch_power(pm)
+    # unbounded: rate_a must not limit flows through p/q variable bounds either
+    variable_branch_power(pm; bounded = false)
     variable_dcline_power(pm)
 
     vm_sps = []
@@ -105,14 +125,10 @@ function build_dc_ac_pf(pm::AbstractPowerModel)
         constraint_power_balance(pm, i)
     end
 
+    # flow definitions only: thermal and angle-difference limits are deliberately absent
     for i in ids(pm, :branch)
         constraint_ohms_yt_from(pm, i)
         constraint_ohms_yt_to(pm, i)
-
-        constraint_voltage_angle_difference(pm, i)
-
-        constraint_thermal_limit_from(pm, i)
-        constraint_thermal_limit_to(pm, i)
     end
 
     for i in ids(pm, :dcline)
@@ -182,6 +198,7 @@ solve.
 function build_dc_ac_device_pf(pm::AbstractPowerModel)
     vm, va = variable_bus_voltage(pm; bounded = false)
     pg, pg_sps = variable_gen_power_real(pm)
+    _free_slack_pg!(pm)
     qg = variable_gen_power_imaginary(pm; bounded = false)
     variable_branch_power(pm)
     variable_dcline_power(pm)

@@ -809,6 +809,24 @@ function apply_solution!(test_case, result)
 end
 
 """
+    warmstart_from_solution!(case)
+
+Seed vm_start/va_start/pg_start/qg_start from the case's own vm/va/pg/qg, so
+Ipopt starts at the stored AC point instead of a flat start.
+"""
+function warmstart_from_solution!(case)
+    for bus in values(case["bus"])
+        haskey(bus, "vm") && (bus["vm_start"] = bus["vm"])
+        haskey(bus, "va") && (bus["va_start"] = bus["va"])
+    end
+    for gen in values(case["gen"])
+        haskey(gen, "pg") && (gen["pg_start"] = gen["pg"])
+        haskey(gen, "qg") && (gen["qg_start"] = gen["qg"])
+    end
+    return case
+end
+
+"""
     solve_dc_ac_pf!(test_case, optimizer; device::Bool = false)
 
 AC-feasible point closest to the generator voltage setpoints, applied back into
@@ -816,6 +834,7 @@ AC-feasible point closest to the generator voltage setpoints, applied back into
 to their grid, then resolves. Returns `(test_case, result)` for the last solve.
 """
 function solve_dc_ac_pf!(test_case, optimizer; device::Bool = false)
+    warmstart_from_solution!(test_case)
     if device
         tap_ids, shift_ids = classify_transformers(test_case)
         prepare_transformer_adjustments(test_case, tap_ids, shift_ids)
@@ -823,6 +842,8 @@ function solve_dc_ac_pf!(test_case, optimizer; device::Bool = false)
         apply_solution!(test_case, device_result)
         # the build leaks a non-serializable penalty dict into test_case (pm.data is it)
         delete!(test_case, "soft_bound_penalty_dict")
+        # re-seed from the device solve's result before the follow-up solve
+        warmstart_from_solution!(test_case)
     end
     result = PowerModels.solve_dc_ac_pf(test_case, optimizer)
     apply_solution!(test_case, result)
@@ -831,20 +852,51 @@ function solve_dc_ac_pf!(test_case, optimizer; device::Bool = false)
 end
 
 """
-    generate_optimal_dataset(dataset_path; device = false, smoke = false)
+Merge `metadata` into `path`, keeping rows for datapoints this run did not
+touch so resumed runs accumulate rather than clobber.
+"""
+function _write_metadata(path, metadata)
+    if isfile(path)
+        prev = DataFrame(XLSX.readtable(path, "metadata"))
+        if "datapoint" in names(prev)
+            prev = prev[.!in.(prev.datapoint, Ref(Set(metadata.datapoint))), :]
+            metadata = vcat(prev, metadata; cols = :union)
+            sort!(metadata, :datapoint)
+        end
+        rm(path)
+    end
+    XLSX.openxlsx(path, mode = "w") do xf
+        sheet = XLSX.addsheet!(xf, "metadata")
+        XLSX.writetable!(sheet, Tables.columntable(metadata))
+    end
+    return path
+end
+
+"""
+    generate_optimal_dataset(dataset_path; device = false, smoke = false, shard_index = nothing, num_shards = 1)
 
 `solve_dc_ac_pf!` over `<dataset_path>/baseline_acpf`, into the sibling
 `dc_ac_device_pf/` or `dc_ac_pf/` under the same index; unconverged datapoints
 are skipped and printed. Also writes `metadata.xlsx`, one row per attempt.
+
+`shard_index`/`num_shards` split whatever is still unsolved in the main
+output into `num_shards` round-robin slices, writing shard `shard_index` to
+its own `..._shard<i>/` dir so concurrent shards never touch the same file;
+merge them back with `merge_shards!`.
 """
-function generate_optimal_dataset(dataset_path; device::Bool = false, smoke::Bool = false, smoke_n::Integer = 10, log_level::String = "error", batch_size::Int = 100)
+function generate_optimal_dataset(dataset_path; device::Bool = false, smoke::Bool = false, smoke_n::Integer = 10,
+                                   log_level::String = "error", batch_size::Int = 100,
+                                   shard_index::Union{Nothing, Integer} = nothing, num_shards::Integer = 1)
     PowerModels.logger_config!(log_level)
     # Ipopt's console output is its own channel, not PowerModels' logger
     ipopt_print_level = log_level == "error" ? 0 : 1
-    ipopt = optimizer_with_attributes(Ipopt.Optimizer, "print_level" => ipopt_print_level)
+    # half Ipopt's default max_iter=3000: converts slow non-convergence into a fast skip
+    ipopt = optimizer_with_attributes(Ipopt.Optimizer,
+                "print_level" => ipopt_print_level, "max_iter" => 1500)
 
     in_dir = joinpath(dataset_path, "baseline_acpf")
-    out_dir = joinpath(dataset_path, device ? "dc_ac_device_pf" : "dc_ac_pf")
+    base_name = device ? "dc_ac_device_pf" : "dc_ac_pf"
+    out_dir = joinpath(dataset_path, shard_index === nothing ? base_name : "$(base_name)_shard$(shard_index)")
     mkpath(out_dir)
 
     datapoints = dataset_datapoints(in_dir)
@@ -854,6 +906,24 @@ function generate_optimal_dataset(dataset_path; device::Bool = false, smoke::Boo
     if smoke
         datapoints = datapoints[1:min(smoke_n, end)]
         println("generate_optimal_dataset: SMOKE mode -- first $(length(datapoints)) datapoint(s) only: $datapoints")
+    end
+
+    if shard_index !== nothing
+        remaining = setdiff(datapoints, dataset_datapoints(joinpath(dataset_path, base_name)))
+        datapoints = remaining[(shard_index + 1):num_shards:end]
+        println("generate_optimal_dataset: shard $shard_index/$num_shards -- $(length(datapoints)) of $(length(remaining)) remaining datapoint(s)")
+    end
+
+    # resume: datapoints already solved are skipped, so re-runs top up instead of duplicating
+    done = dataset_datapoints(out_dir)
+    if !isempty(done)
+        datapoints = setdiff(datapoints, done)
+        @printf("generate_optimal_dataset: %d datapoint(s) already in %s, %d left to solve\n",
+                length(done), out_dir, length(datapoints))
+    end
+    if isempty(datapoints)
+        println("generate_optimal_dataset: nothing to do -- every datapoint is already in $out_dir")
+        return out_dir
     end
 
     metadata = DataFrame(datapoint = Int[], feasible = Bool[], time = Float64[], objective = Float64[])
@@ -894,17 +964,56 @@ function generate_optimal_dataset(dataset_path; device::Bool = false, smoke::Boo
     end
     flush_batch!()
 
-    metadata_path = joinpath(out_dir, "metadata.xlsx")
-    isfile(metadata_path) && rm(metadata_path)
-    XLSX.openxlsx(metadata_path, mode = "w") do xf
-        sheet = XLSX.addsheet!(xf, "metadata")
-        XLSX.writetable!(sheet, Tables.columntable(metadata))
-    end
+    _write_metadata(joinpath(out_dir, "metadata.xlsx"), metadata)
 
     println("generate_optimal_dataset: wrote $written cases to $(joinpath(out_dir, "dataset.h5"))")
     if !isempty(skipped)
         println("generate_optimal_dataset: skipped $(length(skipped)) unconverged datapoint(s), missing from $out_dir: $(sort(skipped))")
     end
+    return out_dir
+end
+
+"""
+    merge_shards!(dataset_path; device = false, num_shards)
+
+Merge `dc_ac_pf_shard0..dc_ac_pf_shard<num_shards-1>` (or the device
+variants) into the main `dc_ac_pf/`, preserving each row's real solve time.
+Safe to re-run: datapoints already in the main output are skipped.
+"""
+function merge_shards!(dataset_path; device::Bool = false, num_shards::Integer)
+    base_name = device ? "dc_ac_device_pf" : "dc_ac_pf"
+    out_dir = joinpath(dataset_path, base_name)
+    mkpath(out_dir)
+    writer = H5Writer(joinpath(out_dir, "dataset.h5"))
+    already = Set(dataset_datapoints(out_dir))
+    metadata = DataFrame(datapoint = Int[], feasible = Bool[], time = Float64[], objective = Float64[])
+
+    merged = 0
+    for k in 0:(num_shards - 1)
+        shard_dir = joinpath(dataset_path, "$(base_name)_shard$(k)")
+        isdir(shard_dir) || continue
+        dps = setdiff(dataset_datapoints(shard_dir), already)
+        isempty(dps) && continue
+
+        timing = read_timing(joinpath(shard_dir, "dataset.h5"))
+        row_of = Dict(dp => i for (i, dp) in enumerate(timing["datapoint"]))
+        batch, batch_acpf, batch_dc = Any[], Float64[], Float64[]
+        for dp in dps
+            push!(batch, load_datapoint(shard_dir, dp))
+            i = row_of[dp]
+            push!(batch_acpf, timing["acpf_time"][i]); push!(batch_dc, timing["dcopf_time"][i])
+        end
+        append_batch!(writer, batch, batch_acpf, batch_dc)
+        union!(already, dps)
+        merged += length(dps)
+
+        shard_meta = joinpath(shard_dir, "metadata.xlsx")
+        isfile(shard_meta) && (metadata = vcat(metadata, DataFrame(XLSX.readtable(shard_meta, "metadata")); cols = :union))
+    end
+    isempty(metadata) || _write_metadata(joinpath(out_dir, "metadata.xlsx"), metadata)
+
+    @printf("merge_shards!: merged %d new datapoint(s) into %s (%d total)\n",
+            merged, out_dir, length(dataset_datapoints(out_dir)))
     return out_dir
 end
 
@@ -1577,15 +1686,15 @@ end
 function main()
     PowerModels.logger_config!("error")
     PERT_NAME = "extreme_pert"
-    # for CASE_NAME in [ "case14", "case57", "case300"]
-    #     file_pth = joinpath(DATA_PATH, "test_cases/data/$CASE_NAME/$PERT_NAME")
-    #     # println("running opf for case $CASE_NAME (no device)...")
-    #     # generate_optimal_dataset(file_pth; device=false, smoke=true)
-    #     # println("running opf for case $CASE_NAME (device)...")
-    #     # generate_optimal_dataset(file_pth; device=true, smoke=true)
-    #     println("running sensitivity_score ac-pf for case $CASE_NAME...")
-    #     generate_sensitivity_score_dataset(file_pth; grainger=true, max_acpf=30, smoke=true, obo = true)
-    # end
+    for CASE_NAME in [ "case14"]
+        file_pth = joinpath(DATA_PATH, "test_cases/data/$CASE_NAME/$PERT_NAME")
+        println("running opf for case $CASE_NAME (no device)...")
+        generate_optimal_dataset(file_pth; device=false, smoke=false)
+        # println("running opf for case $CASE_NAME (device)...")
+        # generate_optimal_dataset(file_pth; device=true, smoke=true)
+        # println("running sensitivity_score ac-pf for case $CASE_NAME...")
+        # generate_sensitivity_score_dataset(file_pth; grainger=true, max_acpf=30, smoke=true, obo = true)
+    end
     # for CASE_NAME in [ "case7336"]
     #     file_pth = joinpath(DATA_PATH, "test_cases/data/$CASE_NAME/$PERT_NAME")
     #     println("running opf for case $CASE_NAME (no device)...")
@@ -1596,30 +1705,74 @@ function main()
     #     generate_sensitivity_score_dataset(file_pth; grainger=true)
     # end
 
-    CASES = [ "case9241_pegase"]
-    NUM_POINTS = 1000
-    BATCH_SIZE = 100
-    TIME_BUDGET_S = 1.5 * 60 * 60   # per case; a case that overruns is abandoned
+    # CASES = [ "case9241_pegase"]
+    # NUM_POINTS = 1000
+    # BATCH_SIZE = 100
+    # TIME_BUDGET_S = 1.5 * 60 * 60   # per case; a case that overruns is abandoned
 
-    for CASE_NAME in CASES
-        println("\n", "="^70)
-        println("generating $NUM_POINTS datapoints for $CASE_NAME ($PERT_NAME)")
-        println("="^70)
-        flush(stdout)
-        try
-            file_pth = joinpath(DATA_PATH, "test_cases/network_info/$CASE_NAME/$(CASE_NAME).m")
-            test_case = prepare_test_case(PowerModels.parse_file(file_pth), CASE_NAME, file_pth)
-            n = generate_data(test_case, NUM_POINTS, CASE_NAME, PERT_NAME;
-                              pert_config_path = "$PERT_NAME.json",
-                              log_level = "error",
-                              batch_size = BATCH_SIZE,
-                              time_budget_s = TIME_BUDGET_S)
-            println("$CASE_NAME: done -- $n datapoints")
-        catch e
-            println("$CASE_NAME: FAILED -- $(sprint(showerror, e))")
-        end
-        GC.gc()
-        flush(stdout)
+    # for CASE_NAME in CASES
+    #     println("\n", "="^70)
+    #     println("generating $NUM_POINTS datapoints for $CASE_NAME ($PERT_NAME)")
+    #     println("="^70)
+    #     flush(stdout)
+    #     try
+    #         file_pth = joinpath(DATA_PATH, "test_cases/network_info/$CASE_NAME/$(CASE_NAME).m")
+    #         test_case = prepare_test_case(PowerModels.parse_file(file_pth), CASE_NAME, file_pth)
+    #         n = generate_data(test_case, NUM_POINTS, CASE_NAME, PERT_NAME;
+    #                           pert_config_path = "$PERT_NAME.json",
+    #                           log_level = "error",
+    #                           batch_size = BATCH_SIZE,
+    #                           time_budget_s = TIME_BUDGET_S)
+    #         println("$CASE_NAME: done -- $n datapoints")
+    #     catch e
+    #         println("$CASE_NAME: FAILED -- $(sprint(showerror, e))")
+    #     end
+    #     GC.gc()
+    #     flush(stdout)
+    # end
+
+end
+
+"""
+    run_cli(args)
+
+CLI entry, two forms:
+  `<case_name> [pert_name] [device] [batch_size] [shard_index] [num_shards]`
+      -- solve one dc_ac_pf shard (or the whole case if shard args omitted)
+  `merge <case_name> [pert_name] [device] [num_shards]`
+      -- combine that case's shards into its main dc_ac_pf/
+Used by run_scripts/run_dc_ac_pf.sh and run_dc_ac_pf_case.sh.
+"""
+function run_cli(args)
+    isempty(args) && error("usage: julia generate_dataset.jl <case_name> [pert_name] [device] [batch_size] [shard_index] [num_shards]")
+
+    if args[1] == "merge"
+        case_name = args[2]
+        pert_name = length(args) >= 3 ? args[3] : "extreme_pert"
+        device = length(args) >= 4 && lowercase(args[4]) in ("device", "true", "1")
+        num_shards = length(args) >= 5 ? parse(Int, args[5]) : error("merge: num_shards required")
+        file_pth = joinpath(DATA_PATH, "test_cases/data/$case_name/$pert_name")
+        isdir(file_pth) || error("run_cli: no such dataset directory: $file_pth")
+        return merge_shards!(file_pth; device = device, num_shards = num_shards)
     end
 
+    case_name = args[1]
+    pert_name = length(args) >= 2 ? args[2] : "extreme_pert"
+    device = length(args) >= 3 && lowercase(args[3]) in ("device", "true", "1")
+    batch_size = length(args) >= 4 ? parse(Int, args[4]) : 100
+    shard_index = length(args) >= 6 ? parse(Int, args[5]) : nothing
+    num_shards = length(args) >= 6 ? parse(Int, args[6]) : 1
+    file_pth = joinpath(DATA_PATH, "test_cases/data/$case_name/$pert_name")
+    isdir(file_pth) || error("run_cli: no such dataset directory: $file_pth")
+    shard_msg = shard_index === nothing ? "" : ", shard $shard_index/$num_shards"
+    println("generate_dataset: $case_name / $pert_name (device = $device$shard_msg) -> $file_pth")
+    flush(stdout)
+    t = @elapsed out = generate_optimal_dataset(file_pth; device = device, batch_size = batch_size,
+                                                 shard_index = shard_index, num_shards = num_shards)
+    @printf("generate_dataset: %s / %s done in %.1f s -> %s\n", case_name, pert_name, t, out)
+    return out
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    run_cli(ARGS)
 end
